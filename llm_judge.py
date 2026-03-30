@@ -1,376 +1,9 @@
-# #!/usr/bin/env python3
-# # -*- coding: utf-8 -*-
-
-# from __future__ import annotations
-
-# import argparse
-# import json
-# import logging
-# import time
-# import re
-# from datetime import datetime
-# from concurrent.futures import ThreadPoolExecutor, as_completed
-# from typing import Any, Dict, Optional
-# import random
-
-# import pandas as pd
-# import requests
-# from tqdm import tqdm
-
-# logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-# logger = logging.getLogger("sglang_runner_simple")
-
-# # 默认 prompt_map（可被 --prompt-map-file 覆盖）
-# DEFAULT_PROMPT_MAP = {
-#     "default": "请判断下面文本是否违规，直接返回 JSON 或简短文本：\n\n{text}",
-#     "文本分类": "请判断下面文本的类别，仅返回 JSON：{\"label\": \"类别名\"}\n\n文本:\n{text}",
-#     "打分": "请对下面文本从0到100进行打分，并返回 JSON：{\"score\": <0-100>}\n\n文本:\n{text}"
-# }
-
-# # 最大 prompt 文本长度（字符），可在运行时由 main() 调整
-# DEFAULT_MAX_TEXT_LENGTH = 4000
-
-# def load_prompt_map_from_py(file_path: Optional[str]) -> Dict[str, str]:
-#     """
-#     从指定的 Python 文件中动态导入 prompt 内容。
-#     要求文件中定义若干字符串变量，例如：
-#         base_prompt = xxx
-#         classify_prompt = xxx
-#     最终返回字典 {"base_prompt": "...", "classify_prompt": "..."}
-#     """
-#     pm = DEFAULT_PROMPT_MAP.copy()
-#     if not file_path:
-#         return pm
-#     try:
-#         import importlib.util
-#         import pathlib
-
-#         file_path = str(pathlib.Path(file_path).resolve())
-#         spec = importlib.util.spec_from_file_location("prompt_module", file_path)
-#         module = importlib.util.module_from_spec(spec)
-#         spec.loader.exec_module(module)  # 执行文件
-
-#         # 收集文件中所有字符串变量
-#         for k, v in vars(module).items():
-#             if not k.startswith("_") and isinstance(v, str):
-#                 pm[k] = v
-#         logger.info("从 %s 加载 %d 个 prompt 模板变量", file_path, len(pm))
-#     except Exception as e:
-#         logger.warning("加载 Python prompt 文件失败，使用默认模板: %s", e)
-#     return pm
-
-
-# def extract_text_from_orig(orig: Any, field: str = "prompt") -> Optional[str]:
-#     if orig is None:
-#         return None
-#     if isinstance(orig, str):
-#         try:
-#             orig = json.loads(orig)
-#         except Exception:
-#             # 字符串不是 JSON，直接作为文本返回
-#             return orig
-#     convs = None
-#     if isinstance(orig, dict):
-#         convs = orig.get("conversations") or orig.get("conversation") or orig.get("messages") or orig.get("dialogue")
-#     if convs is None:
-#         if isinstance(orig, dict) and "content" in orig and "role" in orig:
-#             return orig.get("content")
-#         # 不是会话结构，尝试取常见字段
-#         if isinstance(orig, dict):
-#             for k in ("text", "message", "content", "prompt", "input"):
-#                 if k in orig and isinstance(orig[k], (str,)):
-#                     return orig[k]
-#         return None
-#     last_user = None
-#     last_assistant = None
-#     # print(convs)
-#     for item in convs:
-#         if not isinstance(item, dict):
-#             continue
-#         role = item.get("role") or item.get("sender") or item.get("from")
-#         content = item.get("content") or item.get("text") or item.get("message")
-#         if role is None:
-#             continue
-#         r = str(role).lower()
-#         if r in ("user", "human", "usr", "客户", "用户"):
-#             last_user = content
-#         elif r in ("assistant", "agent", "bot", "客服"):
-#             last_assistant = content
-#     return last_user if field == "prompt" else last_assistant
-
-# def sanitize_and_truncate_text(text: Any, max_len: Optional[int] = None) -> str:
-#     """
-#     将输入转换为字符串、去首尾空白并按 max_len 截断。
-#     如果 max_len 为 None，则使用模块级 DEFAULT_MAX_TEXT_LENGTH（可在运行时修改）。
-#     """
-#     if text is None:
-#         return ""
-#     if not isinstance(text, str):
-#         text = str(text)
-#     text = text.strip()
-#     effective_max = max_len if (max_len is not None) else DEFAULT_MAX_TEXT_LENGTH
-#     try:
-#         if len(text) > effective_max:
-#             return text[:effective_max] + "...(truncated)"
-#     except Exception:
-#         # 如果 len() 出错（极少），退回原始字符串
-#         return text
-#     return text
-
-# def build_prompt(prompt_key: str, row: pd.Series, prompt_map: Dict[str,str], extra: Optional[str]=None) -> str:
-#     """
-#     使用安全替换方式：只替换模板中的 {text} 占位符，避免模板中出现 JSON 花括号引发 str.format 的问题。
-#     若模板没有 {text} 占位符，则在模板后追加文本。
-#     """
-#     if prompt_key not in prompt_map:
-#         prompt_key = "default"
-#     template = prompt_map[prompt_key]
-    
-
-#     prompt = extract_text_from_orig(row.get("orig"), field="prompt") or ""
-#     response = json.loads(row.get("orig"))['response']
-#     # print('response',row.get("orig"))
-#     prompt = sanitize_and_truncate_text(prompt)
-#     response = sanitize_and_truncate_text(response)
-
-#     # 如果模板包含显式的 {text} 占位符，直接替换（不会触发 format 对其它花括号的解析）
-#     if "{text}" in template:
-#         try:
-#             return template.replace("{text}", prompt)
-#         except Exception:
-#             # 保险回退
-#             return template + "\n\n" + prompt
-    
-#     elif "{question}" in template and "{answer}" in template:
-#         return template.replace("{question}", prompt).replace("{answer}", response)
-#     elif "{question}" in template and "{answer}" not in template:
-#         return template.replace("{question}", prompt)
-#     else:
-#         return template + "\n\n" + prompt
-
-# def try_parse_json_from_text(text: Optional[str]) -> Optional[Dict[str,Any]]:
-#     if text is None:
-#         return None
-#     if isinstance(text, dict):
-#         return text
-#     t = text.strip()
-#     try:
-#         parsed = json.loads(t)
-#         if isinstance(parsed, dict):
-#             return parsed
-#     except Exception:
-#         pass
-#     m = re.search(r"\{.*\}", t, flags=re.DOTALL)
-#     if m:
-#         candidate = m.group(0)
-#         try:
-#             parsed = json.loads(candidate)
-#             if isinstance(parsed, dict):
-#                 return parsed
-#         except Exception:
-#             # 尝试修正单引号
-#             try:
-#                 parsed = json.loads(candidate.replace("'", '"'))
-#                 if isinstance(parsed, dict):
-#                     return parsed
-#             except Exception:
-#                 return None
-#     return None
-
-# def forward_local_api_openai(message: str, api_key: Optional[str], base_url: str, model: str,
-#                              temperature: float, max_retries:int, sleep_duration:float, extra_body:Optional[dict]):
-#     try:
-#         from openai import OpenAI
-#     except Exception as e:
-#         return {"status":"import_error","text":None,"raw":str(e)}
-#     base = base_url if base_url.endswith("/v1") else base_url.rstrip("/") + "/v1"
-#     client = OpenAI(api_key=api_key, base_url=base)
-#     stop_tokens = ["<|eot_id|>","<|im_end|>","</s>","<|endoftext|>","</answer>"]
-#     extra = extra_body or {"repetition_penalty":1.05,"chat_template_kwargs":{"enable_thinking":False}}
-#     attempt = 0
-#     while attempt <= max_retries:
-#         print('message',message)
-#         try:
-#             completion = client.chat.completions.create(
-#                 model=model,
-#                 messages=[{"role":"user","content":message}],
-#                 temperature=temperature,
-#                 stop=stop_tokens,
-#                 max_tokens=12000,
-#                 extra_body=extra
-#             )
-#             try:
-#                 text_out = completion.choices[0].message.content
-#             except Exception:
-#                 try:
-#                     text_out = (completion.get("choices",[{}])[0].get("message",{}) or {}).get("content")
-#                 except Exception:
-#                     text_out = str(completion)
-#             if text_out and '</think>' in text_out:
-#                 text_out = text_out.split('</think>')[-1]
-#             return {"status":"ok","text":text_out,"raw":completion}
-#         except Exception as e:
-#             logger.warning("openai client 调用异常: %s", e)
-#             attempt += 1
-#             if attempt>max_retries: break
-#             time.sleep(sleep_duration)
-#     return {"status":"failed","text":None,"raw":f"failed_after_{max_retries}"}
-
-# def forward_local_api_requests(message: str, endpoint: str, headers:Dict[str,str], timeout:float, max_retries:int, sleep_duration:float):
-#     payload = {"text": message}
-#     attempt = 0
-#     while attempt <= max_retries:
-#         try:
-#             resp = requests.post(endpoint, json=payload, headers=headers, timeout=timeout)
-#             try:
-#                 raw = resp.json()
-#             except:
-#                 raw = resp.text
-#             if resp.status_code==200:
-#                 text = None
-#                 if isinstance(raw, dict):
-#                     text = raw.get("text") or raw.get("result") or raw.get("output") or raw.get("reply")
-#                 if text is None:
-#                     text = str(raw)
-#                 return {"status":"ok","text":text,"raw":raw}
-#             else:
-#                 logger.warning("非200响应 %s", resp.status_code)
-#                 attempt += 1
-#                 time.sleep(sleep_duration)
-#         except Exception as e:
-#             logger.warning("requests 调用异常: %s", e)
-#             attempt += 1
-#             time.sleep(sleep_duration)
-#     return {"status":"failed","text":None,"raw":f"failed_after_{max_retries}"}
-
-# def worker(row_idx:int, row:pd.Series, field:str, use_openai:bool, api_key:Optional[str], base_url:str, model:str,
-#            timeout:float, max_retries:int, sleep_duration:float, headers:Dict[str,str], prompt_key_arg:str, prompt_map:Dict[str,str], prompt_extra:Optional[str], extra_body:Optional[dict]):
-#     # extract text existence check
-#     orig = row.get("orig")
-#     text = extract_text_from_orig(orig, field=field)
-#     # print(orig)
-#     if text is None or (isinstance(text,str) and text.strip()==""):
-#         return (row_idx, None)
-#     # determine prompt_key per row
-#     row_prompt_key = row.get("prompt_key") if ("prompt_key" in row.index and row.get("prompt_key") not in (None,"")) else prompt_key_arg
-#     prompt = build_prompt(row_prompt_key, row, prompt_map, extra=prompt_extra)
-#     # print(prompt)
-#     logger.debug("Prompt for row %s: %s", row_idx, prompt)
-#     # forward
-#     if use_openai:
-#         res = forward_local_api_openai(message=prompt, api_key=api_key, base_url=base_url, model=model, temperature=0, max_retries=max_retries, sleep_duration=sleep_duration, extra_body=extra_body)
-#         # print('res',res)
-#     else:
-#         res = forward_local_api_requests(message=prompt, endpoint=base_url, headers=headers, timeout=timeout, max_retries=max_retries, sleep_duration=sleep_duration)
-#     text_out = res.get("text")
-#     # try parse json first (prefer structured result)
-#     # parsed = try_parse_json_from_text(text_out) if isinstance(text_out,str) else None
-#     # if parsed is not None:
-#     #     # store parsed JSON as compact string
-#     #     try:
-#     #         return (row_idx, json.dumps(parsed, ensure_ascii=False))
-#     #     except Exception:
-#     #         return (row_idx, str(parsed))
-#     # fallback to raw text_out
-#     if text_out is not None:
-#         return (row_idx, text_out)
-#     # fallback to raw response dump
-#     raw = res.get("raw")
-#     try:
-#         return (row_idx, json.dumps(raw, ensure_ascii=False))
-#     except Exception:
-#         return (row_idx, str(raw))
-
-# def main():
-#     p = argparse.ArgumentParser()
-#     p.add_argument("--input","-i", required=True)
-#     p.add_argument("--output","-o", required=True)
-#     p.add_argument("--field", choices=["prompt","response"], default="prompt")
-#     p.add_argument("--use-openai-client", action="store_true")
-#     p.add_argument("--api-key", default=None)
-#     p.add_argument("--base-url", default="http://localhost:8035/v1")
-#     p.add_argument("--model", default="Qwen3-30B-A3B-Base-general_totals_202w_concat_lmsys_278w-ep3")
-#     p.add_argument("--concurrency", type=int, default=8)
-#     p.add_argument("--timeout", type=float, default=30.0)
-#     p.add_argument("--max-retries", type=int, default=5)
-#     p.add_argument("--sleep-duration", type=float, default=5.0)
-#     p.add_argument("--header", action="append")
-#     p.add_argument("--sample", type=int, default=0)
-#     p.add_argument("--prompt-key", type=str, default="default")
-#     p.add_argument("--prompt-map-file", type=str, default=None)
-#     p.add_argument("--prompt-extra", type=str, default=None)
-#     p.add_argument("--extra-body", type=str, default=None)
-#     p.add_argument("--max-text-len", type=int, default=DEFAULT_MAX_TEXT_LENGTH)
-#     args = p.parse_args()
-
-#     headers = {}
-#     if args.header:
-#         for h in args.header:
-#             if ":" in h:
-#                 k,v = h.split(":",1)
-#                 headers[k.strip()] = v.strip()
-#     extra_body = None
-#     if args.extra_body:
-#         try:
-#             extra_body = json.loads(args.extra_body)
-#         except Exception:
-#             extra_body = None
-
-#     prompt_map = load_prompt_map_from_py(args.prompt_map_file)
-
-#     logger.info("读取 parquet：%s", args.input)
-#     df = pd.read_parquet(args.input, engine="pyarrow")
-#     logger.info("数据行数：%d", len(df))
-#     if args.sample and args.sample>0:
-#         df = df.iloc[:args.sample].copy()
-#         logger.info("sample 模式，处理前 %d 行", len(df))
-#     df = df.reset_index(drop=True)   # 放在 sample 之后更稳
-#     # 使用 globals() 动态设置模块级默认值，避免在函数中声明 global 导致的 SyntaxError
-#     globals()["DEFAULT_MAX_TEXT_LENGTH"] = args.max_text_len
-
-#     n = len(df)
-#     results = [None] * n
-
-#     logger.info("启动线程池：%d 并发", args.concurrency)
-#     with ThreadPoolExecutor(max_workers=args.concurrency) as exe:
-#         futures = {}
-#         for i,row in df.iterrows():
-#             fut = exe.submit(worker, i, row, args.field, args.use_openai_client, args.api_key, args.base_url, args.model,
-#                              args.timeout, args.max_retries, args.sleep_duration, headers, args.prompt_key, prompt_map, args.prompt_extra, extra_body)
-#             futures[fut] = i
-#         # 使用 tqdm 显示处理进度（基于 futures 完成数）
-#         with tqdm(total=len(futures), desc="Processing", unit="row") as pbar:
-#             for fut in as_completed(futures):
-#                 idx = futures[fut]
-#                 try:
-#                     r = fut.result()
-#                     if r is None:
-#                         results[idx] = None
-#                     else:
-#                         ri, val = r
-#                         results[ri] = val
-#                 except Exception as e:
-#                     logger.exception("future 异常 %s", e)
-#                     results[idx] = None
-#                 finally:
-#                     pbar.update(1)
-
-#     logger.info("将结果写回 sglang_result 字段并保存到：%s", args.output)
-#     df["sglang_result"] = results
-#     df.to_parquet(args.output, engine="pyarrow", index=False)
-#     logger.info("完成，输出文件：%s", args.output)
-
-# if __name__ == "__main__":
-#     main()
-
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 from __future__ import annotations
 
 import argparse
 import json
 import logging
+import os
 import time
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -382,6 +15,8 @@ from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("sglang_runner_simple")
+
+RESULT_COLUMN = "sglang_result"
 
 # 默认 prompt_map（可被 --prompt-map-file 覆盖）
 DEFAULT_PROMPT_MAP = {
@@ -792,14 +427,25 @@ def build_prompt(prompt_key: str, row: pd.Series, field: str, prompt_map: Dict[s
         if extra:
             main_text = f"{main_text}\n\n{extra}" if main_text else extra
 
-    if "{question}" in template or "{answer}" in template:
-        out = template
-        out = out.replace("{question}", question)
-        out = out.replace("{answer}", answer)
+    # 兼容两套占位符风格：
+    # 1. 新格式：{question} / {answer} / {text}
+    # 2. 旧格式：##question## / ##response## / ##text##
+    placeholder_pairs = {
+        "{question}": question,
+        "{answer}": answer,
+        "{text}": main_text,
+        "##question##": question,
+        "##response##": answer,
+        "##text##": main_text,
+    }
+    out = template
+    replaced = False
+    for placeholder, value in placeholder_pairs.items():
+        if placeholder in out:
+            out = out.replace(placeholder, value)
+            replaced = True
+    if replaced:
         return out
-
-    if "{text}" in template:
-        return template.replace("{text}", main_text)
 
     return template + "\n\n" + main_text
 
@@ -833,6 +479,71 @@ def try_parse_json_from_text(text: Optional[str]) -> Optional[Dict[str, Any]]:
     return None
 
 
+def is_missing_result(value: Any) -> bool:
+    if value is None:
+        return True
+    if pd.isna(value):
+        return True
+    if isinstance(value, str) and value.strip() == "":
+        return True
+    return False
+
+
+def validate_existing_output(input_df: pd.DataFrame, existing_df: pd.DataFrame, output_path: str) -> None:
+    if len(existing_df) != len(input_df):
+        raise ValueError(
+            f"已有输出行数与输入不一致，无法安全续跑: input={len(input_df)}, "
+            f"output={len(existing_df)}, path={output_path}"
+        )
+
+    shared_columns = [col for col in input_df.columns if col in existing_df.columns]
+    if not shared_columns:
+        return
+
+    mismatched_columns = [
+        col for col in shared_columns
+        if not input_df[col].equals(existing_df[col])
+    ]
+    if mismatched_columns:
+        preview = ", ".join(mismatched_columns[:5])
+        raise ValueError(
+            f"已有输出与当前输入内容不一致，无法安全续跑: {preview}"
+        )
+
+
+def load_existing_results(input_df: pd.DataFrame, output_path: str) -> List[Any]:
+    results = [None] * len(input_df)
+    if not os.path.exists(output_path):
+        return results
+
+    logger.info("发现已有输出，尝试续跑：%s", output_path)
+    existing_df = pd.read_parquet(output_path, engine="pyarrow")
+    validate_existing_output(input_df, existing_df, output_path)
+
+    if RESULT_COLUMN not in existing_df.columns:
+        logger.warning("已有输出中不存在 %s，将从头开始生成", RESULT_COLUMN)
+        return results
+
+    existing_results = existing_df[RESULT_COLUMN].tolist()
+    completed = 0
+    for idx, value in enumerate(existing_results):
+        if not is_missing_result(value):
+            results[idx] = value
+            completed += 1
+    logger.info("检测到已有结果 %d/%d 条，剩余 %d 条待生成", completed, len(results), len(results) - completed)
+    return results
+
+
+def save_progress(df: pd.DataFrame, output_path: str) -> None:
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    temp_path = f"{output_path}.tmp"
+    df.to_parquet(temp_path, engine="pyarrow", index=False)
+    os.replace(temp_path, output_path)
+
+
 def forward_local_api_openai(
     message: str,
     api_key: Optional[str],
@@ -861,11 +572,12 @@ def forward_local_api_openai(
                 messages=[{"role": "user", "content": message}],
                 temperature=temperature,
                 stop=stop_tokens,
-                max_tokens=12000,
+                max_tokens=24000,
                 extra_body=extra
             )
             try:
                 text_out = completion.choices[0].message.content
+                print(text_out)
             except Exception:
                 try:
                     text_out = (completion.get("choices", [{}])[0].get("message", {}) or {}).get("content")
@@ -1010,6 +722,7 @@ def main():
     p.add_argument("--prompt-extra", type=str, default=None)
     p.add_argument("--extra-body", type=str, default=None)
     p.add_argument("--max-text-len", type=int, default=DEFAULT_MAX_TEXT_LENGTH)
+    p.add_argument("--save-every", type=int, default=200)
     args = p.parse_args()
 
     headers = {}
@@ -1042,15 +755,26 @@ def main():
     globals()["DEFAULT_MAX_TEXT_LENGTH"] = args.max_text_len
 
     n = len(df)
-    results = [None] * n
+    results = load_existing_results(df, args.output)
+    df[RESULT_COLUMN] = results
 
-    logger.info("启动线程池：%d 并发", args.concurrency)
-    with ThreadPoolExecutor(max_workers=args.concurrency) as exe:
-        futures = {}
-        for i, row in df.iterrows():
+    pending_indices = [idx for idx, value in enumerate(results) if is_missing_result(value)]
+    if not pending_indices:
+        logger.info("所有数据都已生成完成，无需补跑：%s", args.output)
+        save_progress(df, args.output)
+        return
+
+    logger.info("启动线程池：%d 并发，待处理 %d/%d 行", args.concurrency, len(pending_indices), n)
+    exe = ThreadPoolExecutor(max_workers=args.concurrency)
+    completed_since_last_save = 0
+    futures = {}
+
+    try:
+        for idx in pending_indices:
+            row = df.iloc[idx]
             fut = exe.submit(
                 worker,
-                i,
+                idx,
                 row,
                 args.field,
                 args.use_openai_client,
@@ -1066,7 +790,7 @@ def main():
                 args.prompt_extra,
                 extra_body
             )
-            futures[fut] = i
+            futures[fut] = idx
 
         with tqdm(total=len(futures), desc="Processing", unit="row") as pbar:
             for fut in as_completed(futures):
@@ -1078,15 +802,28 @@ def main():
                     else:
                         ri, val = r
                         results[ri] = val
+                        df.at[ri, RESULT_COLUMN] = val
                 except Exception as e:
                     logger.exception("future 异常 %s", e)
                     results[idx] = None
+                    df.at[idx, RESULT_COLUMN] = None
                 finally:
+                    completed_since_last_save += 1
+                    if args.save_every > 0 and completed_since_last_save >= args.save_every:
+                        logger.info("周期性保存进度到：%s", args.output)
+                        save_progress(df, args.output)
+                        completed_since_last_save = 0
                     pbar.update(1)
+    except KeyboardInterrupt:
+        logger.warning("收到中断信号，正在保存当前进度：%s", args.output)
+        save_progress(df, args.output)
+        exe.shutdown(wait=False, cancel_futures=True)
+        raise SystemExit(130)
+    finally:
+        exe.shutdown(wait=True, cancel_futures=False)
 
-    logger.info("将结果写回 sglang_result 字段并保存到：%s", args.output)
-    df["sglang_result"] = results
-    df.to_parquet(args.output, engine="pyarrow", index=False)
+    logger.info("将结果写回 %s 并保存到：%s", RESULT_COLUMN, args.output)
+    save_progress(df, args.output)
     logger.info("完成，输出文件：%s", args.output)
 
 
