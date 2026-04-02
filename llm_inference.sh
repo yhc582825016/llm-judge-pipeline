@@ -15,12 +15,12 @@ nohup python /mnt/code/yehangcheng/Intruct_augment/pipline/llm_inference.py \
   --field prompt \
   --use-openai-client \
   --api-key EMPTY \
-  --base-url http://127.0.0.1:6029 \
-  --base-url-weights http://127.0.0.1:6029:1 \
+  --base-url http://127.0.0.1:6032 \
+  --base-url-weights http://127.0.0.1:6032:1 \
   --model "$MODEL" \
   --num-samples 1 \
-  --concurrency 500 \
-  --timeout 60 \
+  --concurrency 100 \
+  --timeout 300 \
   --max-retries 2 \
   --sleep-duration 1 \
   --thinking-mode off \
