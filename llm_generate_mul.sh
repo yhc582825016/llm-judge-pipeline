@@ -5,7 +5,7 @@ MODELS=("local")
 # /mnt/code/yehangcheng/sft_data/multiturn_chat_0.8M/multiturn_chat_0.8M_processed.jsonl
 # /mnt/code/yehangcheng/sft_data/Magpie-Llama-3.1-Pro-MT-300K-Filtered/multi_turn_processed.jsonl
 TEST_DATA_PATH=/mnt/code/yehangcheng/sft_data/Magpie-Llama-3.1-Pro-MT-300K-Filtered/multi_turn_processed.jsonl
-SAVE_PATH=/mnt/code/yehangcheng/sft_data/Magpie-Llama-3.1-Pro-MT-300K-Filtered/multi_turn_processed_qwen3-30b-judge.jsonl
+SAVE_PATH=/mnt/code/yehangcheng/all_data/sft_data/Magpie-Llama-3.1-Pro-MT-300K-Filtered/multi_turn_processed_qwen3-30b-judge.jsonl
 NUM_RETURN_SEQUENCES=1
 TEMPERATRUE=0.6
 unset http_proxy https_proxy

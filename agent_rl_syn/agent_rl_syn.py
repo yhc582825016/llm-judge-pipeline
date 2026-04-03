@@ -129,15 +129,15 @@ class PipelineConfig:
 
 class PromptRepository:
     MOCK_PROMPT = '''
-你现在是一个“工具函数模拟器生成器”。
+你现在是一个“工具函数生成器”。
 
-我会提供一组工具定义。你的任务不是实现真实工具能力，而是为每一个工具生成一个“可执行的 mock 函数”，用于本地测试、单元测试或流程联调。
+我会提供一组工具定义。你的任务不是实现真实外部能力，而是为每一个工具生成一个“本地可执行函数”，用于联调、验证和代码运行。
 
 【核心目标】
 请为每一个工具合成一个可执行函数。由于真实输入空间无限大，你不需要覆盖所有输入，只需要：
 1. 为每个工具挑选若干组“你能确定正确”的输入；
 2. 对这些固定输入返回固定输出；
-3. 对所有未覆盖输入，明确抛出异常或返回“unsupported input”错误；
+3. 对所有未覆盖输入，也要返回“像真实工具一样可消费的失败结果”，而不是直接抛出异常中断流程；
 4. 保证代码可以直接运行；
 5. 保证返回值结构与该工具的接口风格一致。
 
@@ -146,14 +146,36 @@ class PromptRepository:
 2. 每个工具生成一个独立函数，函数名尽量与工具名对应。
 3. 每个函数内部只做“固定输入 -> 固定输出”的映射，不要调用外部网络、数据库、系统命令或真实 API。
 4. 必须保证 deterministic（同样输入永远返回同样输出）。
-5. 对于未覆盖输入，统一：
-   - 抛出 `NotImplementedError` 或 `ValueError`
-   - 错误信息中写明“unsupported mocked input”
-6. 如果一个工具输入是 JSON/dict，则优先基于“规范化后的 JSON 字符串”或关键字段匹配来判断。
-7. 如果某些工具本身很复杂，也不要省略，至少给出 1~3 组固定样例。
-8. 所有函数放在同一个 Python 文件中。
-9. 生成一个 `run_demo()` 函数，演示每个工具至少一组输入输出。
-10. 生成简单测试代码，使用 `assert` 校验固定样例。
+5. 对于未覆盖输入，默认不要抛出 `NotImplementedError`、`ValueError`，也不要返回生硬的占位式报错。
+6. 对于未覆盖输入，统一返回“查询失败 / 未查询到 / 暂无结果 / 处理失败但可继续”的结果对象，风格尽量贴近真实工具返回。推荐在返回中包含下列语义字段中的一部分：
+   - `success`: `False`
+   - `found`: `False`
+   - `status`: 例如 `"not_found"`、`"no_result"`、`"failed"`、`"unavailable"`
+   - `message`: 例如 `"未查询到相关结果"`、`"查询失败，请检查输入后重试"`、`"暂无可用数据"`
+   - `data` / `result` / `items`: 空对象、空列表或与该工具风格一致的默认值
+7. 即使参数取值未命中、参数名有偏差、请求条件不完整，或调用方传入了不理想的内容，也优先返回自然、稳定、可继续处理的失败结果，不要暴露内部规则、固定样例、预置组合、占位实现等信息。
+8. 只有在“输入不是可解析对象、类型完全不符合函数签名、运行到无法构造任何合理返回值”的极少数情况下，才允许抛出 `ValueError`；即便如此，错误信息也必须像真实服务报错，例如：
+   - `"request parameters are invalid"`
+   - `"unable to process the current request"`
+   - `"bad request"`
+   不要出现任何与占位实现、预置样例或内部兜底逻辑相关的措辞。
+9. 如果一个工具天然像搜索、检索、查询、列表、详情、识别、转换、解析、推荐、统计等真实接口，那么请优先按照真实接口回包风格生成：
+   - 命中已知样例时返回成功结果；
+   - 未命中样例时返回失败但结构稳定的结果；
+   - 不要让调用方因为“查不到”就直接 crash。
+10. 如果一个工具输入是 JSON/dict，则优先基于“规范化后的 JSON 字符串”或关键字段匹配来判断。
+11. 如果某些工具本身很复杂，也不要省略，至少给出 1~3 组固定样例。
+12. 所有函数放在同一个 Python 文件中。
+13. 生成一个 `run_demo()` 函数，演示每个工具至少一组“成功样例”，并尽量额外演示一组“未命中但返回友好失败结果”的样例。
+14. 生成简单测试代码，使用 `assert` 校验固定成功样例；同时至少补充少量断言，校验未覆盖输入会返回结构化失败结果，而不是暴露内部实现痕迹。
+15. 对返回值风格的额外要求：
+   - 若工具描述看起来像 OpenAI function/tool 调用结果，优先返回 `dict`
+   - 若是列表型接口，可返回 `{"success": True/False, "items": [...], "total": n, "message": "..."}`
+   - 若是详情型接口，可返回 `{"success": True/False, "result": {...} 或 None, "message": "..."}`
+   - 若是转换/计算型接口，在无法处理时返回 `{"success": False, "input": 原输入, "result": None, "message": "..."}`
+   - 若是 OCR/抽取/识别型接口，在失败时返回 `{"success": False, "extracted": None 或 {}, "message": "..."}`
+16. 所有失败返回都必须 deterministic，且文案自然，不能包含明显暴露占位实现、固定样例、内部兜底规则、预置组合限制的措辞。
+17. 输出代码中的函数返回必须让调用方感觉自己在和真实工具交互，而不是和占位实现交互。
 
 【输出格式要求】
 你必须严格只输出以下两段内容，不能多写任何解释、说明、前言、后记。
@@ -203,7 +225,7 @@ class PromptRepository:
 13. 你必须严格按照我指定的三段格式输出，且字段名必须完全一致。
 14. 题目应当使用部分或全部可用能力，但必须体现真实用户意图，不能显得像“为了覆盖能力而覆盖能力”。
 15. PROMPT 请控制在 120 个汉字以内；如果超过，说明题目设计得过于复杂，请重写得更直接。
-16. `PROMPT` 中禁止出现任何“mock / mocked / 模拟 / 测试数据 / 样例数据 / 当前数据集 / 本地数据 / 演示环境 / run_demo”之类暴露生成背景的话。
+16. `PROMPT` 中禁止出现任何暴露生成背景的话，例如测试数据、样例数据、当前数据集、本地数据、演示环境、`run_demo` 等。
 17. 不要在 `PROMPT` 里要求回答者“按某种格式作答”，不要出现“请将最终答案写成”“输出为”“返回为”等格式指令；这些只允许放在 `OUTPUT_FORMAT` 字段。
 18. 题目必须确实需要借助外部能力检索或计算后才能回答。若工具之间存在依赖关系，可设计为串行；若存在可独立查询的子问题，可设计为并行；也可以是串并行混合。但这些求解结构不要明说在题面里。
 19. 优先生成带有真实生活或业务语境的问题，例如查询、比对、筛选、排期、核验、推荐、定位、统计，不要生成“为了验证系统而提问”的句子。
@@ -236,7 +258,7 @@ ANSWER:
 10. 不要输出解题过程，不要输出分析，不要输出额外说明。
 11. 你必须严格按照我指定的三段格式输出，且字段名必须完全一致。
 12. 题目应当使用部分或全部可用能力，但必须体现真实用户意图，不能显得像“为了覆盖能力而覆盖能力”。
-13. `PROMPT` 中禁止出现任何“mock / mocked / 模拟 / 测试数据 / 样例数据 / 当前数据集 / 本地数据 / 演示环境 / run_demo”之类暴露生成背景的话。
+13. `PROMPT` 中禁止出现任何暴露生成背景的话，例如测试数据、样例数据、当前数据集、本地数据、演示环境、`run_demo` 等。
 14. 不要在 `PROMPT` 里要求回答者“按某种格式作答”，不要出现“请将最终答案写成”“输出为”“返回为”等格式指令；这些只允许放在 `OUTPUT_FORMAT` 字段。
 15. 题目必须确实需要借助外部能力检索或计算后才能回答；根据工具关系，可以是串行、并行或串并行混合求解，但不要把这种结构直接写进题面。
 16. 优先生成带有真实生活或业务语境的问题，例如查询、比对、筛选、排期、核验、推荐、定位、统计，不要生成“为了验证系统而提问”的句子。
@@ -453,14 +475,21 @@ print(json.dumps(REPORT, ensure_ascii=False))
     def _quality_check(self, module_code: str, test_code: str) -> Dict[str, Any]:
         issues = []
 
-        if "unsupported mocked input" not in module_code:
-            issues.append("module code does not contain 'unsupported mocked input'")
+        banned_phrases = [
+            "unsupported mocked input",
+            "No mock defined",
+            "not implemented for this input",
+            "only specific predefined combinations are supported",
+        ]
+        for phrase in banned_phrases:
+            if phrase in module_code:
+                issues.append(f"module code contains banned fallback phrase: {phrase}")
 
         if "assert " not in test_code and "assert(" not in test_code:
             issues.append("test code does not contain assert")
 
-        if "def run_demo" not in test_code:
-            issues.append("test code does not contain run_demo")
+        if "def run_demo" not in module_code:
+            issues.append("module code does not contain run_demo")
 
         if "def test_" not in test_code:
             issues.append("test code does not contain any test_* function")
@@ -684,11 +713,11 @@ class ToolSynthesisPipeline:
         guidance = '''
 【原始问题增强要求】
 下面我会额外提供一条原始用户问题，目的是帮助你理解这些工具最可能被怎样组合使用。
-请据此优化你生成的 mock 函数和测试样例：
+请据此优化你生成的函数和测试样例：
 1. 优先覆盖原始问题中最核心、最可能出现的参数组合与查询路径。
 2. 如果原始问题涉及多步查询，请尽量让固定样例能支撑这类串行、并行或串并行混合求解。
 3. 仍然只生成 deterministic 的固定映射，不要实现真实外部能力。
-4. 原始问题只是帮助你挑选更贴近真实场景的 mocked 输入输出，不代表你必须逐字复现其中每个字段。
+4. 原始问题只是帮助你挑选更贴近真实场景的输入输出，不代表你必须逐字复现其中每个字段。
 5. 不要在输出代码或错误信息中泄露“原始问题增强”“参考问题”等字样。
 '''.strip()
 

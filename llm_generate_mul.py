@@ -15,6 +15,17 @@ You need to solve the following problem. I will provide you with a reference ans
             There is no need to use tags such as "<think>", "</think>", "<answer>", or "</answer>" in your output.
 '''
 
+
+def extract_conversations(item):
+    if not isinstance(item, dict):
+        return None
+    return (
+        item.get("conversations")
+        or item.get("conversation")
+        or item.get("messages")
+        or item.get("dialogue")
+    )
+
 def preprocess(messages):
     # assert len(messages) == 2
     history = ''
@@ -44,10 +55,9 @@ def forward_local_api(messages, max_retries=5, sleep_duration=60, model='Qwen2.5
         messages = preprocess2(messages)
     elif "role" in messages[0] or "content" in messages[0]:
         messages = preprocess(messages)
-    port = random.choices(['8026'])
     client = OpenAI(
         api_key="your_api_key_here",
-        base_url=f"http://10.16.80.150:{port[0]}/v1",
+        base_url=args.base_url,
     )
     # print('messages',messages)
     for attempt in range(1, max_retries + 1):
@@ -89,6 +99,13 @@ def load_jsonl_to_list(file_path, dedup_key=None):
                     if key_val in seen:
                         continue
                     seen.add(key_val)
+                elif dedup_key == "conversations":
+                    convs = extract_conversations(obj)
+                    if convs is not None:
+                        key_val = json.dumps(convs, ensure_ascii=False)
+                        if key_val in seen:
+                            continue
+                        seen.add(key_val)
                 data.append(obj)
             except json.JSONDecodeError:
                 continue
@@ -104,6 +121,10 @@ def load_jsonl_to_set(file_path, key="conversations"):
                 obj = json.loads(line)
                 if key in obj:
                     result_set.add(json.dumps(obj[key], ensure_ascii=False))
+                elif key == "conversations":
+                    convs = extract_conversations(obj)
+                    if convs is not None:
+                        result_set.add(json.dumps(convs, ensure_ascii=False))
             except json.JSONDecodeError:
                 continue
     return result_set
@@ -134,6 +155,9 @@ def get_args():
     parser.add_argument("--num_threads", type=int, default=25)
     parser.add_argument("--max_samples", type=int, default=50)
     parser.add_argument("--save_path", type=str, required=True)
+    parser.add_argument("--base_url", type=str, default="http://10.16.80.150:8026/v1")
+    parser.add_argument("--resume", action="store_true", default=True)
+    parser.add_argument("--no_resume", dest="resume", action="store_false")
     parser.add_argument("--user_reference", type=bool, default=False)
     parser.add_argument("--drop_last", type=bool, default=False)
     # parser.add_argument("--enable_thinking", type=bool, default=False)
@@ -145,11 +169,11 @@ class LLMInference:
 
         raw_dataset = load_jsonl_to_list(args.data_path, dedup_key="conversations")
         print('raw_dataset',len(raw_dataset))
-        saved_convs = load_jsonl_to_set(args.save_path, key="conversations")
+        saved_convs = load_jsonl_to_set(args.save_path, key="conversations") if args.resume else set()
         print('saved_convs',len(saved_convs))
         filtered_data = [
             item for item in raw_dataset
-            if json.dumps(item.get("conversations"), ensure_ascii=False) not in saved_convs
+            if json.dumps(extract_conversations(item), ensure_ascii=False) not in saved_convs
         ]
 
         if args.max_samples:
@@ -163,8 +187,10 @@ class LLMInference:
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_item = {
-                executor.submit(forward_local_api, item['conversations'], 1, 60, self.args.model): item
+                executor.submit(forward_local_api, convs, 1, 60, self.args.model): item
                 for item in ds
+                for convs in [extract_conversations(item)]
+                if convs
             }
             for future in tqdm(as_completed(future_to_item), total=len(future_to_item), desc="Inference"):
                 item = future_to_item[future]
