@@ -9,8 +9,8 @@ import numpy as np
 import pandas as pd
 
 
-DEFAULT_INPUT = "/mnt/code/yehangcheng/Intruct_augment/gen_data/agent_syn_data/synthetic_mock_success_only_2.jsonl"
-DEFAULT_OUTPUT = "/mnt/code/yehangcheng/Intruct_augment/pipline/agent_rl_syn/syn_data/train_filtered_from_mock_2.parquet"
+DEFAULT_INPUT = "/dev/shm/ye/rl-data/agent_syn_data/recall/synthetic_mock_success_only_5.jsonl"
+DEFAULT_OUTPUT = "/dev/shm/ye/rl-data/agent_syn_data/recall/synthetic_mock_success_only_5.parquet"
 
 
 TYPE_MAP = {

@@ -1,3 +1,5 @@
+import argparse
+import ast
 import os
 import re
 import sys
@@ -15,6 +17,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from openai import OpenAI
 from tqdm import tqdm
+try:
+    from .prompt import build_mock_prompt_with_context, build_qa_prompt_with_context
+except ImportError:
+    from prompt import build_mock_prompt_with_context, build_qa_prompt_with_context
 
 
 # ============================================================
@@ -96,7 +102,7 @@ class PipelineConfig:
     output_path: str                         # 只保存最终成功样本
     progress_path: str                       # 保存全部过程记录（成功 / 失败 / 错误）
 
-    base_url: str = "http://127.0.0.1:6032/v1"
+    base_url: str = "http://127.0.0.1:6031/v1"
     api_key: str = "EMPTY"
     model: str = "/opt/users/Qwen/Qwen3.5-397B"
 
@@ -108,7 +114,7 @@ class PipelineConfig:
     min_tool_calls: int = 0                  # 若只保留多工具样本，可改为 2
     max_samples: Optional[int] = None
 
-    qa_mode: str = "difficult"               # "difficult" / "easy"
+    qa_mode: str = "difficult"               # "extra_difficult" / "boundary_missing" / "difficult" / "easy"
     use_original_question_for_generation: bool = False
 
     test_timeout_sec: int = 30
@@ -121,172 +127,8 @@ class PipelineConfig:
     num_workers: int = 4                     # 多线程并发数
     resume: bool = True                      # 是否断点续跑
     success_only_output: bool = True         # output_path 只写成功样本
-
-
-# ============================================================
-# Prompt 模板
-# ============================================================
-
-class PromptRepository:
-    MOCK_PROMPT = '''
-你现在是一个“工具函数生成器”。
-
-我会提供一组工具定义。你的任务不是实现真实外部能力，而是为每一个工具生成一个“本地可执行函数”，用于联调、验证和代码运行。
-
-【核心目标】
-请为每一个工具合成一个可执行函数。由于真实输入空间无限大，你不需要覆盖所有输入，只需要：
-1. 为每个工具挑选若干组“你能确定正确”的输入；
-2. 对这些固定输入返回固定输出；
-3. 对所有未覆盖输入，也要返回“像真实工具一样可消费的失败结果”，而不是直接抛出异常中断流程；
-4. 保证代码可以直接运行；
-5. 保证返回值结构与该工具的接口风格一致。
-
-【实现要求】
-1. 使用 Python 实现。
-2. 每个工具生成一个独立函数，函数名尽量与工具名对应。
-3. 每个函数内部只做“固定输入 -> 固定输出”的映射，不要调用外部网络、数据库、系统命令或真实 API。
-4. 必须保证 deterministic（同样输入永远返回同样输出）。
-5. 对于未覆盖输入，默认不要抛出 `NotImplementedError`、`ValueError`，也不要返回生硬的占位式报错。
-6. 对于未覆盖输入，统一返回“查询失败 / 未查询到 / 暂无结果 / 处理失败但可继续”的结果对象，风格尽量贴近真实工具返回。推荐在返回中包含下列语义字段中的一部分：
-   - `success`: `False`
-   - `found`: `False`
-   - `status`: 例如 `"not_found"`、`"no_result"`、`"failed"`、`"unavailable"`
-   - `message`: 例如 `"未查询到相关结果"`、`"查询失败，请检查输入后重试"`、`"暂无可用数据"`
-   - `data` / `result` / `items`: 空对象、空列表或与该工具风格一致的默认值
-7. 即使参数取值未命中、参数名有偏差、请求条件不完整，或调用方传入了不理想的内容，也优先返回自然、稳定、可继续处理的失败结果，不要暴露内部规则、固定样例、预置组合、占位实现等信息。
-8. 只有在“输入不是可解析对象、类型完全不符合函数签名、运行到无法构造任何合理返回值”的极少数情况下，才允许抛出 `ValueError`；即便如此，错误信息也必须像真实服务报错，例如：
-   - `"request parameters are invalid"`
-   - `"unable to process the current request"`
-   - `"bad request"`
-   不要出现任何与占位实现、预置样例或内部兜底逻辑相关的措辞。
-9. 如果一个工具天然像搜索、检索、查询、列表、详情、识别、转换、解析、推荐、统计等真实接口，那么请优先按照真实接口回包风格生成：
-   - 命中已知样例时返回成功结果；
-   - 未命中样例时返回失败但结构稳定的结果；
-   - 不要让调用方因为“查不到”就直接 crash。
-10. 如果一个工具输入是 JSON/dict，则优先基于“规范化后的 JSON 字符串”或关键字段匹配来判断。
-11. 如果某些工具本身很复杂，也不要省略，至少给出 1~3 组固定样例。
-12. 所有函数放在同一个 Python 文件中。
-13. 生成一个 `run_demo()` 函数，演示每个工具至少一组“成功样例”，并尽量额外演示一组“未命中但返回友好失败结果”的样例。
-14. 生成简单测试代码，使用 `assert` 校验固定成功样例；同时至少补充少量断言，校验未覆盖输入会返回结构化失败结果，而不是暴露内部实现痕迹。
-15. 对返回值风格的额外要求：
-   - 若工具描述看起来像 OpenAI function/tool 调用结果，优先返回 `dict`
-   - 若是列表型接口，可返回 `{"success": True/False, "items": [...], "total": n, "message": "..."}`
-   - 若是详情型接口，可返回 `{"success": True/False, "result": {...} 或 None, "message": "..."}`
-   - 若是转换/计算型接口，在无法处理时返回 `{"success": False, "input": 原输入, "result": None, "message": "..."}`
-   - 若是 OCR/抽取/识别型接口，在失败时返回 `{"success": False, "extracted": None 或 {}, "message": "..."}`
-16. 所有失败返回都必须 deterministic，且文案自然，不能包含明显暴露占位实现、固定样例、内部兜底规则、预置组合限制的措辞。
-17. 输出代码中的函数返回必须让调用方感觉自己在和真实工具交互，而不是和占位实现交互。
-
-【输出格式要求】
-你必须严格只输出以下两段内容，不能多写任何解释、说明、前言、后记。
-
-第一段：正式函数代码区
-必须以这一行开始：
-===PYTHON_MODULE_START===
-
-必须以这一行结束：
-===PYTHON_MODULE_END===
-
-第二段：测试代码区
-必须以这一行开始：
-===PYTHON_TEST_START===
-
-必须以这一行结束：
-===PYTHON_TEST_END===
-
-【强制格式要求】
-1. 两段都必须是纯 Python 代码内容，不要再嵌套 markdown 代码块。
-2. 输出中除这四个标记和两段 Python 代码外，不能有任何其他文字。
-3. 正式函数代码区必须可以单独保存为一个 `.py` 文件并被 import。
-4. 测试代码区必须可以单独提取出来用于测试。
-5. 整个回答中，这四个标记各自只能出现一次。
-
-下面是工具定义：
-'''.strip()
-
-    DIFFICULT_PROMPT = '''
-请基于你生成的工具集合，设计一道“必须依赖这些能力才能得到答案”的标准问答题。
-
-这里的“难”指的是：需要在同一个真实任务中做信息定位、条件筛选、一步到两步的组合推理；不是把多个无关领域的事实强行拼在一起。
-
-要求如下：
-1. 只生成 1 道题。
-2. `PROMPT` 必须只包含一段自然、真实的用户提问，像聊天或业务场景里的正常询问，不要像测试脚本，不要出现“工具”“函数”“接口”“调用”等字样。
-3. 问题必须围绕同一个主题、对象或任务场景展开，所有查询步骤都要服务于同一个明确目标。
-4. 问题不能只靠常识直接回答，必须结合可获取的信息或可执行能力才能得出结果。
-5. 难度主要来自“筛选条件、字段理解、结果比对、一步到两步计算或归纳”，不要来自生造背景、堆砌限制或跨领域混搭。
-6. 最终答案必须是简短、唯一、可验证的客观答案，例如一个数字、一个日期、一个名称，或一个非常短的结构化结果。
-7. 答案必须可以被明确校验，不能是开放式回答，不能模糊，不能带解释。
-8. 最多只允许 2 到 3 个紧密相关的求解步骤；不要把多个彼此独立的小问题硬拼成一道题。
-9. 禁止把体育、金融、农业、地理、医疗、娱乐等无关领域强行组合；禁止为了制造难度而引入与主任务无关的背景设定。
-10. 禁止无意义的字符串加工，例如截取首字母、拼接代号、强制大小写变换、凑固定花哨格式；除非这本身就是任务目标中自然且必要的一部分。
-11. 输出格式应尽量简单自然，优先使用单个值，或最多 2 个字段的短结构；不要设计冗长格式约束。
-12. 不要输出解题过程，不要输出分析，不要输出额外说明。
-13. 你必须严格按照我指定的三段格式输出，且字段名必须完全一致。
-14. 题目应当使用部分或全部可用能力，但必须体现真实用户意图，不能显得像“为了覆盖能力而覆盖能力”。
-15. PROMPT 请控制在 120 个汉字以内；如果超过，说明题目设计得过于复杂，请重写得更直接。
-16. `PROMPT` 中禁止出现任何暴露生成背景的话，例如测试数据、样例数据、当前数据集、本地数据、演示环境、`run_demo` 等。
-17. 不要在 `PROMPT` 里要求回答者“按某种格式作答”，不要出现“请将最终答案写成”“输出为”“返回为”等格式指令；这些只允许放在 `OUTPUT_FORMAT` 字段。
-18. 题目必须确实需要借助外部能力检索或计算后才能回答。若工具之间存在依赖关系，可设计为串行；若存在可独立查询的子问题，可设计为并行；也可以是串并行混合。但这些求解结构不要明说在题面里。
-19. 优先生成带有真实生活或业务语境的问题，例如查询、比对、筛选、排期、核验、推荐、定位、统计，不要生成“为了验证系统而提问”的句子。
-
-请严格按照下面格式输出：
-
-PROMPT:
-<你生成的自然语言问题>
-
-OUTPUT_FORMAT:
-<该问题要求回答者使用的最终输出格式，例如：//box{值}>
-
-ANSWER:
-<该问题唯一且可验证的标准答案，必须严格符合 OUTPUT_FORMAT 中定义的格式>
-'''.strip()
-
-    EASY_PROMPT = '''
-请基于我提供的工具集合，设计一道“必须依赖这些能力才能得到答案”的标准问答题。
-
-要求如下：
-1. 只生成 1 道题。
-2. `PROMPT` 必须只包含一段自然、真实的用户提问，像聊天或业务场景里的正常询问，不要像测试脚本，不要出现“工具”“函数”“接口”“调用”等字样。
-3. 问题必须围绕同一个主题、对象或任务场景展开，不要跨领域拼接无关信息。
-4. 问题不能只靠常识直接回答，必须结合可获取的信息或可执行能力才能得出结果。
-5. 最终答案必须是简短、唯一、可验证的客观答案，例如一个数字、一个日期、一个名称，或一个非常短的结构化结果。
-6. 答案必须可以被明确校验，不能是开放式回答，不能模糊，不能带解释。
-7. 问题难度适中，不要设计成超长推理题，也不要依赖主观判断。
-8. 最多只允许 1 到 2 个紧密相关的求解步骤，不要堆砌条件，不要做无意义字符串拼接。
-9. 输出格式应尽量简单自然，优先使用单个值，或最多 2 个字段的短结构。
-10. 不要输出解题过程，不要输出分析，不要输出额外说明。
-11. 你必须严格按照我指定的三段格式输出，且字段名必须完全一致。
-12. 题目应当使用部分或全部可用能力，但必须体现真实用户意图，不能显得像“为了覆盖能力而覆盖能力”。
-13. `PROMPT` 中禁止出现任何暴露生成背景的话，例如测试数据、样例数据、当前数据集、本地数据、演示环境、`run_demo` 等。
-14. 不要在 `PROMPT` 里要求回答者“按某种格式作答”，不要出现“请将最终答案写成”“输出为”“返回为”等格式指令；这些只允许放在 `OUTPUT_FORMAT` 字段。
-15. 题目必须确实需要借助外部能力检索或计算后才能回答；根据工具关系，可以是串行、并行或串并行混合求解，但不要把这种结构直接写进题面。
-16. 优先生成带有真实生活或业务语境的问题，例如查询、比对、筛选、排期、核验、推荐、定位、统计，不要生成“为了验证系统而提问”的句子。
-
-请严格按照下面格式输出：
-
-PROMPT:
-<你生成的自然语言问题>
-
-OUTPUT_FORMAT:
-<该问题要求回答者使用的最终输出格式，例如：//box{值}>
-
-ANSWER:
-<该问题唯一且可验证的标准答案，必须严格符合 OUTPUT_FORMAT 中定义的格式>
-'''.strip()
-
-    @classmethod
-    def get_qa_prompt(cls, mode: str) -> str:
-        return cls.DIFFICULT_PROMPT if mode == "difficult" else cls.EASY_PROMPT
-
-    @classmethod
-    def build_original_question_context(cls, original_question: Optional[str]) -> str:
-        if not original_question:
-            return ""
-        return (
-            "\n\n【原始用户问题（仅作语义参考，不可照抄）】\n"
-            f"{original_question.strip()}\n"
-        )
+    require_quality_ok: bool = True          # 成功样本必须通过质量门槛
+    enable_rule_verifier: bool = True        # 启用规则 verifier
 
 
 # ============================================================
@@ -379,6 +221,175 @@ class ResponseParser:
         }
 
 
+class MockContextBuilder:
+    @staticmethod
+    def build(module_code: str, max_functions: int = 8) -> str:
+        try:
+            tree = ast.parse(module_code)
+        except Exception:
+            return module_code[:4000]
+
+        lines: List[str] = []
+        fn_count = 0
+        for node in tree.body:
+            if not isinstance(node, ast.FunctionDef) or node.name.startswith("_") or node.name == "run_demo":
+                continue
+
+            fn_count += 1
+            if fn_count > max_functions:
+                lines.append(f"... 其余函数省略，共 {fn_count} 个以上函数")
+                break
+
+            args = []
+            for arg in node.args.args:
+                if arg.arg == "self":
+                    continue
+                args.append(arg.arg)
+
+            lines.append(f"- 函数: {node.name}({', '.join(args)})")
+
+            doc = ast.get_docstring(node)
+            if doc:
+                lines.append(f"  说明: {doc.strip()[:200]}")
+
+            sample_returns: List[str] = []
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Return):
+                    try:
+                        val = ast.literal_eval(inner.value)
+                    except Exception:
+                        continue
+                    if isinstance(val, (dict, list, str, int, float, bool)) and val not in sample_returns:
+                        sample_returns.append(json.dumps(val, ensure_ascii=False)[:300])
+                    if len(sample_returns) >= 2:
+                        break
+
+            for idx, sample in enumerate(sample_returns, 1):
+                lines.append(f"  样例返回{idx}: {sample}")
+
+        return "\n".join(lines).strip() or module_code[:4000]
+
+
+class RuleVerifier:
+    FORBIDDEN_PROMPT_TERMS = (
+        "测试数据", "样例数据", "当前数据集", "本地数据", "演示环境", "run_demo",
+        "mock", "mocked", "工具调用", "函数调用", "评测",
+    )
+
+    @staticmethod
+    def _extract_function_names(module_code: str) -> List[str]:
+        try:
+            tree = ast.parse(module_code)
+        except Exception:
+            return []
+
+        names = []
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and not node.name.startswith("_") and node.name != "run_demo":
+                names.append(node.name)
+        return names
+
+    @staticmethod
+    def _detect_required_tool_count(prompt_text: str) -> int:
+        text = prompt_text or ""
+        if any(token in text for token in ("然后", "最后", "分别", "同时", "先", "再", "并")):
+            return 2
+        return 1
+
+    @staticmethod
+    def _parse_diag(answer_text: str) -> Dict[str, str]:
+        text = (answer_text or "").strip()
+        match = re.fullmatch(r"//diag\{(.*)\}", text, flags=re.DOTALL)
+        if not match:
+            return {}
+
+        body = match.group(1).strip()
+        result: Dict[str, str] = {}
+        for part in body.split(";"):
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            result[key.strip()] = value.strip()
+        return result
+
+    @classmethod
+    def verify(cls, qa_info: Dict[str, str], module_code: str, qa_mode: str) -> Dict[str, Any]:
+        issues: List[str] = []
+        prompt_text = qa_info.get("PROMPT", "").strip()
+        output_format = qa_info.get("OUTPUT_FORMAT", "").strip()
+        answer = qa_info.get("ANSWER", "").strip()
+
+        if not prompt_text:
+            issues.append("empty prompt")
+        if not output_format:
+            issues.append("empty output_format")
+        if not answer:
+            issues.append("empty answer")
+
+        for term in cls.FORBIDDEN_PROMPT_TERMS:
+            if term.lower() in prompt_text.lower():
+                issues.append(f"prompt leaks generation context: {term}")
+                break
+
+        if len(prompt_text) > (150 if qa_mode == "extra_difficult" else 120):
+            issues.append("prompt too long for selected qa_mode")
+
+        if output_format.startswith("//box{") and not answer.startswith("//box{"):
+            issues.append("answer does not match //box output format")
+        if output_format.startswith("//diag{") and not answer.startswith("//diag{"):
+            issues.append("answer does not match //diag output format")
+
+        if prompt_text and answer and prompt_text == answer:
+            issues.append("prompt and answer are identical")
+
+        function_names = cls._extract_function_names(module_code)
+        if not function_names:
+            issues.append("no callable mocked functions extracted from module")
+
+        if qa_mode == "extra_difficult" and len(function_names) < 2:
+            issues.append("extra_difficult sample has fewer than 2 mocked functions")
+
+        if qa_mode == "boundary_missing":
+            fmt_diag = cls._parse_diag(output_format)
+            ans_diag = cls._parse_diag(answer)
+            if not fmt_diag:
+                issues.append("boundary_missing output_format is not valid //diag")
+            if not ans_diag:
+                issues.append("boundary_missing answer is not valid //diag")
+
+            if fmt_diag.get("tag") != "BOUNDARY_CASE_V1" or ans_diag.get("tag") != "BOUNDARY_CASE_V1":
+                issues.append("boundary_missing tag must be BOUNDARY_CASE_V1")
+
+            allowed_cases = {"missing_parameters", "missing_functions"}
+            allowed_actions = {"clarifying_question", "graceful_decline"}
+            answer_case = ans_diag.get("case")
+            answer_action = ans_diag.get("expected_action")
+            if answer_case not in allowed_cases:
+                issues.append("boundary_missing case is invalid")
+            if answer_action not in allowed_actions:
+                issues.append("boundary_missing expected_action is invalid")
+            if answer_case == "missing_parameters" and answer_action != "clarifying_question":
+                issues.append("missing_parameters must map to clarifying_question")
+            if answer_case == "missing_functions" and answer_action != "graceful_decline":
+                issues.append("missing_functions must map to graceful_decline")
+            if ans_diag.get("answer") != "<TBD>" and ans_diag.get("answer") != "TBD":
+                issues.append("boundary_missing answer placeholder must stay TBD")
+        else:
+            required_tool_count = cls._detect_required_tool_count(prompt_text)
+            if required_tool_count > len(function_names):
+                issues.append("prompt implies more steps than available mocked functions")
+
+        if "首字母" in prompt_text or "acronym" in prompt_text.lower():
+            issues.append("meaningless letter-concat style prompt")
+
+        return {
+            "ok": len(issues) == 0,
+            "issues": issues,
+            "mock_function_count": len(function_names),
+            "mock_function_names": function_names,
+        }
+
+
 # ============================================================
 # Mock 测试器
 # ============================================================
@@ -405,7 +416,6 @@ sys.path.insert(0, ROOT)
 REPORT = {
     "ok": False,
     "syntax_ok": True,
-    "run_demo_found": False,
     "test_functions": [],
     "passed": [],
     "failed": [],
@@ -429,19 +439,13 @@ except Exception:
     print(json.dumps(REPORT, ensure_ascii=False))
     raise SystemExit(0)
 
-ordered_names = []
-if hasattr(test_mod, "run_demo") and callable(getattr(test_mod, "run_demo")):
-    REPORT["run_demo_found"] = True
-    ordered_names.append("run_demo")
-
 test_names = sorted(
     name for name in dir(test_mod)
     if name.startswith("test_") and callable(getattr(test_mod, name))
 )
 REPORT["test_functions"] = test_names
-ordered_names.extend(test_names)
 
-for name in ordered_names:
+for name in test_names:
     fn = getattr(test_mod, name)
     try:
         fn()
@@ -488,11 +492,23 @@ print(json.dumps(REPORT, ensure_ascii=False))
         if "assert " not in test_code and "assert(" not in test_code:
             issues.append("test code does not contain assert")
 
-        if "def run_demo" not in module_code:
-            issues.append("module code does not contain run_demo")
-
         if "def test_" not in test_code:
             issues.append("test code does not contain any test_* function")
+
+        empty_return_patterns = [
+            r"return\s+\[\s*\]",
+            r"return\s+\"\"",
+            r"return\s+''",
+            r"return\s+\{\s*\}",
+            r"return\s+None",
+        ]
+        empty_return_hits = 0
+        for p in empty_return_patterns:
+            empty_return_hits += len(re.findall(p, module_code))
+        if empty_return_hits >= 4:
+            issues.append(
+                f"module code contains too many empty fallback returns ({empty_return_hits} hits)"
+            )
 
         return {
             "quality_ok": len(issues) == 0,
@@ -511,7 +527,6 @@ print(json.dumps(REPORT, ensure_ascii=False))
                 "syntax_ok": False,
                 "module_syntax_error": module_syntax_error,
                 "test_syntax_error": test_syntax_error,
-                "run_demo_found": False,
                 "test_functions": [],
                 "passed": [],
                 "failed": [],
@@ -543,7 +558,6 @@ print(json.dumps(REPORT, ensure_ascii=False))
                     "ok": False,
                     "syntax_ok": True,
                     "timeout": True,
-                    "run_demo_found": False,
                     "test_functions": [],
                     "passed": [],
                     "failed": [{"name": "__timeout__", "error": f"timeout > {self.timeout_sec}s"}],
@@ -558,7 +572,6 @@ print(json.dumps(REPORT, ensure_ascii=False))
                     "ok": False,
                     "syntax_ok": True,
                     "timeout": False,
-                    "run_demo_found": False,
                     "test_functions": [],
                     "passed": [],
                     "failed": [{"name": "__empty_stdout__", "error": stderr or "empty stdout"}],
@@ -573,7 +586,6 @@ print(json.dumps(REPORT, ensure_ascii=False))
                 report = {
                     "ok": False,
                     "syntax_ok": True,
-                    "run_demo_found": False,
                     "test_functions": [],
                     "passed": [],
                     "failed": [{"name": "__parse_report__", "error": stdout}],
@@ -639,40 +651,6 @@ class ToolSynthesisPipeline:
 
         return total
 
-    def build_mock_prompt(self, tools: List[Dict[str, Any]]) -> str:
-        lines: List[str] = [PromptRepository.MOCK_PROMPT, "", "【可用工具】"]
-
-        if not tools:
-            lines.append("无")
-            return "\n".join(lines)
-
-        for i, t in enumerate(tools, 1):
-            fn = t.get("function", {})
-            name = fn.get("name", "")
-            desc = fn.get("description", "")
-            params = fn.get("parameters", {})
-            required = set(params.get("required", []))
-            props = params.get("properties", {})
-
-            lines.append(f"{i}. {name}")
-            if desc:
-                lines.append(f"   描述: {desc}")
-
-            if props:
-                lines.append("   参数:")
-                for p_name, p_info in props.items():
-                    p_type = p_info.get("type", "any")
-                    p_desc = p_info.get("description", "")
-                    req_mark = " [必填]" if p_name in required else ""
-                    line = f"   - {p_name}: {p_type}{req_mark}"
-                    if p_desc:
-                        line += f" - {p_desc}"
-                    lines.append(line)
-            else:
-                lines.append("   参数: 无")
-
-        return "\n".join(lines)
-
     @staticmethod
     def extract_original_user_question(sample: Dict[str, Any]) -> str:
         msgs = sample.get("messages", []) if isinstance(sample, dict) else []
@@ -701,59 +679,35 @@ class ToolSynthesisPipeline:
 
         return ""
 
-    def build_mock_prompt_with_context(
-        self,
-        tools: List[Dict[str, Any]],
-        original_question: str = "",
-    ) -> str:
-        base_prompt = self.build_mock_prompt(tools)
-        if not (self.config.use_original_question_for_generation and original_question):
-            return base_prompt
-
-        guidance = '''
-【原始问题增强要求】
-下面我会额外提供一条原始用户问题，目的是帮助你理解这些工具最可能被怎样组合使用。
-请据此优化你生成的函数和测试样例：
-1. 优先覆盖原始问题中最核心、最可能出现的参数组合与查询路径。
-2. 如果原始问题涉及多步查询，请尽量让固定样例能支撑这类串行、并行或串并行混合求解。
-3. 仍然只生成 deterministic 的固定映射，不要实现真实外部能力。
-4. 原始问题只是帮助你挑选更贴近真实场景的输入输出，不代表你必须逐字复现其中每个字段。
-5. 不要在输出代码或错误信息中泄露“原始问题增强”“参考问题”等字样。
-'''.strip()
-
-        return (
-            base_prompt
-            + "\n"
-            + guidance
-            + PromptRepository.build_original_question_context(original_question)
-        )
-
-    def build_qa_prompt_with_context(self, original_question: str = "") -> str:
-        base_prompt = PromptRepository.get_qa_prompt(self.config.qa_mode)
-        if not (self.config.use_original_question_for_generation and original_question):
-            return base_prompt
-
-        guidance = '''
-【原始问题增强要求】
-下面我会额外提供一条原始用户问题，目的是帮助你生成更高质量的新题目。
-请严格遵守以下要求：
-1. 将它视为“语义风格与真实任务意图”的参考，而不是要你原样改写。
-2. 你生成的是一道新的题目，必须仍然以我给定的 `PROMPT / OUTPUT_FORMAT / ANSWER` 三段格式输出。
-3. 新题目应尽量继承原始问题的真实感、任务目标和信息组织方式，但要结合当前你已经生成的 mock 工具能力，确保答案可被当前 mock 数据唯一支撑。
-4. 允许你对原始问题做收缩、重组、具体化或轻度改写，让它更适合产出唯一、可校验、便于 RL 使用的最终答案。
-5. 如果原始问题本身没有约束最终答案格式，请你自行把结果收束成简短唯一的目标，并把格式要求只写在 `OUTPUT_FORMAT` 中，不要写进 `PROMPT`。
-6. 不要在 `PROMPT` 中提及原始问题、mock、测试、样例、数据集等生成背景。
-'''.strip()
-
-        return (
-            base_prompt
-            + "\n"
-            + guidance
-            + PromptRepository.build_original_question_context(original_question)
-        )
-
     def should_process(self, sample: Dict[str, Any]) -> bool:
         return self.count_tool_calls(sample) >= self.config.min_tool_calls
+
+    @staticmethod
+    def is_meaningless_letter_concat_question(prompt_text: str) -> bool:
+        """
+        过滤掉“查若干文本后取首字母拼接”这类无意义 QA。
+        """
+        text = (prompt_text or "").lower()
+        patterns = [
+            r"首字母",
+            r"第一个单词的首字母",
+            r"拼在一起",
+            r"拼接(成)?字符串",
+            r"initial letter",
+            r"first letter",
+            r"first word",
+            r"acronym",
+        ]
+        if not any(re.search(p, text) for p in patterns):
+            return False
+
+        context_hints = [
+            r"标题",
+            r"新闻",
+            r"title",
+            r"headline",
+        ]
+        return any(re.search(p, text) for p in context_hints)
 
     def process_one(self, sample: Dict[str, Any], sample_idx: int) -> Dict[str, Any]:
         start_time = time.time()
@@ -774,7 +728,11 @@ class ToolSynthesisPipeline:
                 record["original_question"] = original_question
 
             # 1) 生成 mock module + test
-            mock_prompt = self.build_mock_prompt_with_context(tools, original_question)
+            mock_prompt = build_mock_prompt_with_context(
+                tools,
+                self.config.use_original_question_for_generation,
+                original_question,
+            )
             messages = [{"role": "user", "content": mock_prompt}]
             mock_response = self.llm.chat(messages)
             messages.append({"role": "assistant", "content": mock_response})
@@ -783,20 +741,54 @@ class ToolSynthesisPipeline:
             module_code = parsed_code["module_code"]
             test_code = parsed_code["test_code"]
 
-            # 2) 基于已有上下文生成 QA
-            qa_prompt = self.build_qa_prompt_with_context(original_question)
-            qa_messages = messages + [{"role": "user", "content": qa_prompt}]
-            qa_response = self.llm.chat(qa_messages)
-            qa_info = ResponseParser.extract_qa(qa_response)
+            # 2) 解耦生成 QA：只给出原始问题和 mocked 环境摘要，不续写 mock 代码生成对话
+            mock_context = MockContextBuilder.build(module_code)
+            qa_prompt = build_qa_prompt_with_context(
+                self.config.qa_mode,
+                self.config.use_original_question_for_generation,
+                original_question,
+                mock_context=mock_context,
+            )
+            qa_response = ""
+            qa_info: Dict[str, str] = {}
+            qa_retry_blocked = False
+            for qa_try in range(2):
+                extra_guard = ""
+                if qa_try > 0:
+                    extra_guard = (
+                        "\n\n额外约束：严禁生成“先查多条文本/标题再取首字母拼接字符串”的题型。"
+                        "这类题目没有实际业务意义，必须重写为真实查询/筛选/比对任务。"
+                    )
+                qa_messages = [{"role": "user", "content": qa_prompt + extra_guard}]
+                qa_response = self.llm.chat(qa_messages)
+                qa_info = ResponseParser.extract_qa(qa_response)
+                if not self.is_meaningless_letter_concat_question(qa_info.get("PROMPT", "")):
+                    break
+                qa_retry_blocked = True
+            if qa_retry_blocked and self.is_meaningless_letter_concat_question(qa_info.get("PROMPT", "")):
+                raise ValueError("qa prompt is meaningless letter-concat style after retry")
 
             # 3) 执行 mock 测试
             test_report = self.test_runner.run(module_code, test_code)
+            verifier_report = (
+                RuleVerifier.verify(qa_info, module_code, self.config.qa_mode)
+                if self.config.enable_rule_verifier
+                else {"ok": True, "issues": [], "mock_function_count": 0, "mock_function_names": []}
+            )
+            quality_ok = test_report.get("quality_ok", True)
+            verifier_ok = verifier_report.get("ok", True)
+            test_ok = test_report.get("ok", False)
+            final_ok = test_ok and verifier_ok
+            if self.config.require_quality_ok:
+                final_ok = final_ok and quality_ok
 
             record.update({
-                "status": "ok" if test_report.get("ok") else "test_failed",
+                "status": "ok" if final_ok else "test_failed",
                 "qa_mode": self.config.qa_mode,
                 "qa": qa_info,
                 "test_report": test_report,
+                "verifier_report": verifier_report,
+                "mock_context": mock_context,
                 "elapsed_sec": round(time.time() - start_time, 3),
             })
 
@@ -934,22 +926,52 @@ class ToolSynthesisPipeline:
 # ============================================================
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--input-path",
+        default="/dev/shm/ye/rl-data/agent_syn_data/tool_use_no_think_v2_first_2w.jsonl",
+    )
+    parser.add_argument(
+        "--output-path",
+        default="/dev/shm/ye/rl-data/agent_syn_data/recall/synthetic_mock_success_only_3.jsonl",
+    )
+    parser.add_argument(
+        "--progress-path",
+        default="/dev/shm/ye/rl-data/agent_syn_data/recall/synthetic_mock_progress.jsonl",
+    )
+    parser.add_argument(
+        "--qa-mode",
+        default="extra_difficult",
+        choices=["extra_difficult", "boundary_missing", "difficult", "easy"],
+    )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=20000,
+    )
+    parser.add_argument(
+        "--min-tool-calls",
+        type=int,
+        default=3,
+    )
+    args = parser.parse_args()
+
     config = PipelineConfig(
-        input_path="/mnt/code/yehangcheng/all_data/sft_data/Nemotron-Post-Training-Dataset-v1/tool_use_no_think_v2.jsonl",
+        input_path=args.input_path,
 
         # 只保存最终成功样本
-        output_path="/mnt/code/yehangcheng/Intruct_augment/gen_data/agent_syn_data/synthetic_mock_success_only_2.jsonl",
+        output_path=args.output_path,
 
         # 保存全部过程记录，便于排查和断点续跑观察
-        progress_path="/mnt/code/yehangcheng/Intruct_augment/gen_data/agent_syn_data/synthetic_mock_progress.jsonl",
+        progress_path=args.progress_path,
 
         # 如果你只想处理并行 / 多工具样本，就改成 2
-        min_tool_calls=2,
+        min_tool_calls=args.min_tool_calls,
 
         # 全量跑
-        max_samples=5000,
+        max_samples=args.max_samples,
 
-        qa_mode="difficult",
+        qa_mode=args.qa_mode,
         use_original_question_for_generation=True,
 
         # 全量生产建议别覆盖，避免误删历史结果
