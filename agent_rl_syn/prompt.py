@@ -1,3 +1,5 @@
+import json
+
 from typing import Any, Dict, List, Optional
 
 
@@ -29,6 +31,12 @@ class PromptRepository:
    - `data` / `result` / `items`: 与该工具风格一致的默认值（允许为空，但不能长期只给空壳）
 6.1 每个工具至少提供 3 组“成功命中样例”，且这些样例应覆盖不同参数组合或不同业务分支；不要只做 1 个成功样例。
 6.2 每个工具至少提供 2 组“失败但有信息量的样例”（如 not_found、invalid_filter、out_of_range），并在返回中体现失败原因与可恢复提示。
+6.2.1 成功样例不仅要数量足够，还要尽量能够支撑多步 agent 任务：优先覆盖可用于“先定位对象、再筛选候选、再核验约束、最后执行或回填结果”的关键查询路径；若某工具常作为上游检索或下游核验环节，请让成功样例中的关键字段足以支持后续步骤继续使用。
+6.2.2 对于失败样例，不要只给同一种失败；应尽量区分不同失败类型，并在返回中明确体现失败原因。优先覆盖下列类型中的至少 2 类，若工具语义允许则尽量覆盖更多：
+   - `not_found`: 对象不存在、未查到结果、候选为空
+   - `invalid_filter`: 筛选条件不合法、不受支持或无法解析
+   - `missing_required`: 缺少必需参数、关键信息不足
+   - `conflict`: 条件冲突、状态冲突、候选不唯一或资源不可同时满足
 6.3 严禁把绝大多数输入都简单兜底成 `[]`、`""`、`{}`、`None`。未命中时可为空，但必须同时返回有语义的状态字段和消息字段，让调用方能区分“无数据”“参数问题”“服务不可用”等不同失败类型。
 6.4 若工具属于列表/检索类接口，成功样例中的 `items` 不应总是单条；至少部分样例返回 2~5 条结构化记录，且字段合理。
 6.5 若工具属于详情/查询类接口，成功样例中的 `result`/`data` 应包含多个关键字段（如 id/name/time/status/value），不能仅返回一个空字符串或极简占位。
@@ -111,6 +119,10 @@ class PromptRepository:
 17. 不要在 `PROMPT` 里要求回答者“按某种格式作答”，不要出现“请将最终答案写成”“输出为”“返回为”等格式指令；这些只允许放在 `OUTPUT_FORMAT` 字段。
 18. 题目必须确实需要借助外部能力检索或计算后才能回答。若工具之间存在依赖关系，可设计为串行；若存在可独立查询的子问题，可设计为并行；也可以是串并行混合。但这些求解结构不要明说在题面里。
 19. 优先生成带有真实生活或业务语境的问题，例如查询、比对、筛选、排期、核验、推荐、定位、统计，不要生成“为了验证系统而提问”的句子。
+20. `PROMPT`、`OUTPUT_FORMAT`、`ANSWER` 三者必须强绑定：题面最终要用户交付什么，`OUTPUT_FORMAT` 就只能约束那个最终交付物，`ANSWER` 也必须正好是该交付物，三者的对象类型、字段数、数量级必须一致。
+21. 不要把“中间检索步骤”直接堆进 `PROMPT` 里，除非这些条件本身就是最终交付物定义的一部分。题面要聚焦最终决策目标，而不是把求解过程逐步写出来。
+22. 如果 `PROMPT` 问的是单个名称/数字/日期，`OUTPUT_FORMAT` 应该就是单值格式；如果 `PROMPT` 问的是列表、多字段结果、判断结论，`OUTPUT_FORMAT` 与 `ANSWER` 也必须显式呈现列表、多字段或判断值，不能偷换成单个 `//box{值}`。
+23. 在输出前先自检：仅看 `PROMPT`，人类是否能直接理解为什么最终答案应该长成 `OUTPUT_FORMAT` 规定的样子；如果不能，必须重写。
 
 请严格按照下面格式输出：
 
@@ -166,6 +178,10 @@ ANSWER:
 24. 不要在 `PROMPT` 里要求回答者“按某种格式作答”，不要出现“请将最终答案写成”“输出为”“返回为”等格式指令；这些只允许放在 `OUTPUT_FORMAT` 字段。
 25. 优先生成带有真实生活或业务语境的问题，例如查询、比对、筛选、排期、核验、推荐、定位、统计，不要生成“为了验证系统而提问”的句子。
 26. 在生成最终结果前，你必须先自检：当前 mocked 工具样例是否真的足以完整解题、是否确实需要多工具、是否符合 action-oriented 任务形态，以及答案是否唯一；若任一条件不满足，就重写。
+27. `PROMPT`、`OUTPUT_FORMAT`、`ANSWER` 必须是强约束关系，不允许松散拼接。题面最终要求返回什么对象、几个对象、几个字段，输出格式和标准答案就必须一一对应。
+28. 不要把“先查A、再筛B、最后核验C”这种中间过程原样塞进题面，再只让答案输出其中一个碎片结果。中间步骤可以隐含存在，但题面应聚焦最终交付物。
+29. 如果题面最终要的是列表、候选集、双字段结果、状态判断或带条件的结论，`OUTPUT_FORMAT` 和 `ANSWER` 必须完整承载这些内容；不能用与题面目标弱相关的单值 `//box{...}` 草率收尾。
+30. 在输出前先做一致性检查：只看 `PROMPT` 与 `OUTPUT_FORMAT`，应能清楚推断标准答案为何是该结构；若答案结构像是“另一个问题的答案”，必须重写。
 
 请严格按照下面格式输出：
 
@@ -238,6 +254,9 @@ ANSWER:
 14. 不要在 `PROMPT` 里要求回答者“按某种格式作答”，不要出现“请将最终答案写成”“输出为”“返回为”等格式指令；这些只允许放在 `OUTPUT_FORMAT` 字段。
 15. 题目必须确实需要借助外部能力检索或计算后才能回答；根据工具关系，可以是串行、并行或串并行混合求解，但不要把这种结构直接写进题面。
 16. 优先生成带有真实生活或业务语境的问题，例如查询、比对、筛选、排期、核验、推荐、定位、统计，不要生成“为了验证系统而提问”的句子。
+17. `PROMPT`、`OUTPUT_FORMAT`、`ANSWER` 三者必须紧密对应：题面问什么最终结果，输出格式就约束什么结果，标准答案就完整回答什么结果。
+18. 不要把与最终输出弱相关的中间步骤写成题面主体，也不要让 `OUTPUT_FORMAT` 和 `ANSWER` 只覆盖题面中的一小部分信息。
+19. 如果题面要求的是多个对象、多个字段或判断结论，`OUTPUT_FORMAT` 和 `ANSWER` 也必须明确体现相同的数量和结构；不能把多项任务偷换成单个 `//box{值}`。
 
 请严格按照下面格式输出：
 
@@ -282,6 +301,132 @@ ANSWER:
 2. 题目必须能被当前 mocked 环境唯一支撑并求解；若 mock 信息不足，就重写题目。
 3. 若某个思路只依赖单个函数即可完成，而当前模式要求更高难度或多工具协作，请重写题目。
 4. 不要在 `PROMPT` 中泄露 mock、mocked、样例、测试、代码、函数摘要等背景信息。
+5. 题面里的每个显式要求都必须在最终答案中有对应落点；不要写很多中间查询动作，却只在 `ANSWER` 中给出一个弱相关碎片。
+6. 优先把多步能力收束成一个清晰的最终交付物，再让 `OUTPUT_FORMAT` 和 `ANSWER` 与这个交付物严格对齐。
+'''.strip()
+
+    FILTER_REVIEW_PROMPT = '''
+你是一个用于 agent 合成数据的终审质检员。你的任务不是改写样本，而是判断这个样本是否值得保留给后续训练或评测使用。
+
+请围绕下面五个维度做严格评审：
+1. `mock_quality`
+   - mocked module 是否像“可消费的本地工具”，而不是明显占位实现。
+   - 是否存在明显暴露内部实现的话术，例如 “unsupported mocked input”“No mock defined”“only specific predefined combinations are supported”。
+   - 是否大量使用 `[]`、`""`、`{}`、`None` 之类空壳返回来敷衍未命中输入。
+   - 测试是否具备基本有效性，例如包含 `test_*` 入口、存在断言、不是空测或纯形式测。
+2. `qa_consistency`
+   - `PROMPT` / `OUTPUT_FORMAT` / `ANSWER` 是否三者强绑定、对象一致、结构一致。
+   - 如果题目问的是多项结果、多字段结果或列表，`OUTPUT_FORMAT` 不能偷换成单值 `//box{...}`。
+   - `ANSWER` 必须严格符合 `OUTPUT_FORMAT`，且不能与 `PROMPT` 基本相同。
+3. `answerability`
+   - 题目是否真的能被当前 mocked 能力唯一支撑并求解，不能依赖 mock 中不存在的字段、隐含知识或额外常识补全。
+   - extra_difficult / difficult 样本要体现真实的多步查询、筛选、核验或组合求解价值，而不是表面多步、实际单步可答。
+   - boundary_missing 样本必须真的是“缺参数先澄清”或“缺能力应拒绝”，且 `//diag{...}` 的 case / expected_action 映射正确。
+4. `task_realism`
+   - 题目是否像真实用户目标，而不是为了覆盖工具而覆盖工具。
+   - 严禁无意义任务，例如“查多条标题后取首字母拼接字符串”“只做 acronym/首字母拼接”“只有浅层字符串游戏或无业务意义的机械加工”。
+   - 尽量偏真实的查询、筛选、定位、核验、排期、推荐、统计、执行/回填类任务。
+5. `mode_fit`
+   - `PROMPT` 长度、题目复杂度、结构与 `qa_mode` 是否匹配。
+   - `PROMPT` 中不得泄露生成背景，例如测试数据、样例数据、当前数据集、本地数据、演示环境、run_demo、mock、mocked、工具调用、函数调用、评测等。
+
+请按下面原则给结论：
+- 只要存在结构性硬伤，就判 `reject`。例如：题目不可解、格式不一致、答案不匹配、边界类型错、明显无意义任务、mock/test 明显占位或极差。
+- 只有当样本整体可运行、可解、结构自洽、任务真实时，才判 `accept`。
+- 不要因为轻微措辞、命名风格、字段顺序等小问题就拒绝；重点抓会伤害数据质量的核心问题。
+
+你的输出必须是严格 JSON，不能带 markdown，字段必须完整：
+{
+  "decision": "accept" 或 "reject",
+  "confidence": 0 到 100 的整数,
+  "summary": "一句中文总结",
+  "fatal_issues": ["..."],
+  "minor_issues": ["..."],
+  "dimension_scores": {
+    "mock_quality": 1 到 5 的整数,
+    "qa_consistency": 1 到 5 的整数,
+    "answerability": 1 到 5 的整数,
+    "task_realism": 1 到 5 的整数,
+    "mode_fit": 1 到 5 的整数
+  }
+}
+
+如果你认为样本可接受，`fatal_issues` 必须为空数组。
+'''.strip()
+
+    AGENT_SYN_SELECT_PROMPT = '''
+你是一个“agentic RL 合成种子筛选器”。
+
+我会给你一条原始工具使用样本，包括：
+- 工具定义
+- 原始对话 / 工具调用轨迹
+- 若干统计信息
+
+你的任务不是评价当前 assistant 回答得好不好，而是判断：这条样本的工具集合与可观测返回字段，是否适合作为后续合成 agentic RL 数据的“种子样本”。
+
+这里的目标数据要求非常明确：
+1. 应当能合成出“有一定难度”的真实任务。
+2. 解题时应当需要结合多个工具获取信息，最好包含串行依赖、并行汇总、交叉核验或筛选后确认。
+3. 最终答案必须能收束成简短、唯一、可验证的 final answer ground truth。
+4. 问题要像真实用户目标，而不是为了覆盖工具而拼凑。
+
+请重点围绕下面五个维度严格评估：
+1. `tool_synergy`
+   - 这些工具是否围绕同一个主题/对象/任务自然协作。
+   - 是否存在清晰的上游检索 -> 下游详情 / 核验 / 执行动作链路。
+   - 如果工具只是堆在一起但彼此无关，或明显跨域硬拼，应低分。
+2. `multi_step_depth`
+   - 是否天然支持至少 2 个以上相关工具参与的多步求解。
+   - 是否真的需要筛选、比对、核验、回填、确认，而不是单工具一次查询就能答完。
+   - 如果本质上是单跳查一个值，或只是把多个独立小问题拼在一起，应低分。
+3. `ground_truth_feasibility`
+   - 从工具定义和已观测返回字段看，是否能构造“唯一、客观、短小、可校验”的最终答案。
+   - 更偏好：单个名称、日期、数值、短结构化对象、明确判断结论。
+   - 如果返回主要是开放式长文本、主观总结、模糊推荐、不可唯一收束的报告，应低分。
+4. `synthesis_potential`
+   - 是否容易基于这些工具合成新的自然问题，并给出对应 ground truth。
+   - 是否能在不暴露工具背景的情况下，把中间步骤收束成一个清晰最终交付物。
+   - 如果很难写出自然题面，或者题目大概率会变成开放式报告题，应低分。
+5. `realism_focus`
+   - 整体是否像真实 agent 任务，而不是“工具超市”式样本。
+   - 若工具池过大、主题发散、跨域拼接严重、业务目标不集中，应低分。
+   - 若任务目标真实清晰，例如查询、定位、筛选、核验、确认、排期、推荐后落到单一决策，更适合接受。
+
+请特别遵守以下拒绝原则：
+- 只靠单个工具或单次查询就能得到答案的样本，通常应拒绝。
+- 多工具但彼此无关、靠强行跨域拼接制造复杂度的样本，应拒绝。
+- 很难收束出唯一 final answer ground truth 的样本，应拒绝。
+- 明显更适合做开放式 long-form assistant 回复，而不是 final-answer RL 的样本，应拒绝。
+- 工具数量极多但缺乏主题聚焦、像通用杂烩 API 集合的样本，通常应拒绝。
+
+同时也请注意：
+- 原始轨迹中如果出现了错误调用、参数缺失、assistant 走偏，不应自动判死刑。
+- 只要工具本身仍然能支撑“多工具、多步、可验证 final answer”的新题目，就可以接受。
+- 你的判断要“主要看工具是否适合后续合成”，原始对话只作为真实任务意图与字段可观测性的参考。
+
+请按下面原则给结论：
+- 只有当样本明显适合后续合成高质量 agentic RL final-answer 数据时，才判 `accept`。
+- 只要存在结构性硬伤，例如主题发散、单工具即可解、答案无法唯一验证、题面很难自然生成，就判 `reject`。
+
+你的输出必须是严格 JSON，不能带 markdown，字段必须完整：
+{
+  "decision": "accept" 或 "reject",
+  "confidence": 0 到 100 的整数,
+  "summary": "一句中文总结",
+  "fatal_issues": ["..."],
+  "minor_issues": ["..."],
+  "dimension_scores": {
+    "tool_synergy": 1 到 5 的整数,
+    "multi_step_depth": 1 到 5 的整数,
+    "ground_truth_feasibility": 1 到 5 的整数,
+    "synthesis_potential": 1 到 5 的整数,
+    "realism_focus": 1 到 5 的整数
+  },
+  "suggested_task_pattern": "一句短语，描述更适合的题型；若 reject 也要给出最接近的可行方向或填 not_recommended",
+  "suggested_answer_type": "single_value | short_object | short_list | binary_decision | not_recommended"
+}
+
+如果你认为样本可接受，`fatal_issues` 必须为空数组。
 '''.strip()
 
     @classmethod
@@ -377,4 +522,198 @@ def build_qa_prompt_with_context(
             "\n\n【当前 mocked 函数摘要】\n" + mock_context.strip() + "\n",
         ])
 
+    return "\n".join(parts)
+
+
+def _truncate_text(text: Any, max_chars: int) -> str:
+    if text is None:
+        return ""
+    text = str(text)
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + f"\n...<truncated {len(text) - max_chars} chars>"
+
+
+def _safe_json_dumps(obj: Any) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True)
+    except Exception:
+        return str(obj)
+
+
+def _format_tools_for_filter(tools: Any, max_chars: int = 6000) -> str:
+    if not tools:
+        return "[]"
+    return _truncate_text(_safe_json_dumps(tools), max_chars)
+
+
+def _format_tools_for_selection(
+    tools: Any,
+    max_tools: int = 20,
+    max_chars: int = 9000,
+) -> str:
+    if not isinstance(tools, list) or not tools:
+        return "[]"
+
+    names: List[str] = []
+    lines: List[str] = [f"total_tools: {len(tools)}"]
+
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function", {}) if isinstance(tool.get("function", {}), dict) else {}
+        name = str(fn.get("name", "")).strip()
+        if name:
+            names.append(name)
+
+    if names:
+        lines.append("all_tool_names: " + ", ".join(names))
+
+    for idx, tool in enumerate(tools[:max_tools], 1):
+        if not isinstance(tool, dict):
+            continue
+
+        fn = tool.get("function", {}) if isinstance(tool.get("function", {}), dict) else {}
+        name = str(fn.get("name", "")).strip() or f"<tool_{idx}>"
+        desc = str(fn.get("description", "")).strip()
+        params = fn.get("parameters", {}) if isinstance(fn.get("parameters", {}), dict) else {}
+        required = set(params.get("required", [])) if isinstance(params.get("required", []), list) else set()
+        props = params.get("properties", {}) if isinstance(params.get("properties", {}), dict) else {}
+
+        lines.append(f"{idx}. {name}")
+        if desc:
+            lines.append("   desc: " + _truncate_text(desc, 240))
+
+        param_parts: List[str] = []
+        for p_name, p_info in list(props.items())[:12]:
+            p_type = "any"
+            if isinstance(p_info, dict):
+                p_type = str(p_info.get("type", "any"))
+            req_mark = "*" if p_name in required else ""
+            param_parts.append(f"{p_name}:{p_type}{req_mark}")
+
+        if param_parts:
+            lines.append("   params: " + ", ".join(param_parts))
+        elif required:
+            lines.append("   required: " + ", ".join(sorted(required)))
+        else:
+            lines.append("   params: <none>")
+
+    if len(tools) > max_tools:
+        lines.append(f"... omitted {len(tools) - max_tools} tools")
+
+    return _truncate_text("\n".join(lines), max_chars)
+
+
+def _format_messages_for_selection(
+    messages: Any,
+    max_messages: int = 18,
+    max_chars: int = 9000,
+) -> str:
+    if not isinstance(messages, list) or not messages:
+        return "<empty>"
+
+    lines: List[str] = []
+    for idx, message in enumerate(messages[:max_messages], 1):
+        if not isinstance(message, dict):
+            continue
+
+        role = str(message.get("role", "")).strip() or "<unknown>"
+        content = message.get("content", "")
+
+        if isinstance(content, str):
+            normalized = content
+            if role in {"tool_call", "tool_response"}:
+                try:
+                    normalized = _safe_json_dumps(json.loads(content))
+                except Exception:
+                    normalized = content
+        else:
+            normalized = _safe_json_dumps(content)
+
+        lines.append(f"[{idx}] role={role}")
+        lines.append(_truncate_text(normalized, 900))
+
+    if len(messages) > max_messages:
+        lines.append(f"... omitted {len(messages) - max_messages} messages")
+
+    return _truncate_text("\n\n".join(lines), max_chars)
+
+
+def build_filter_prompt_with_context(record: Dict[str, Any]) -> str:
+    qa = record.get("qa") or {}
+    test_report = record.get("test_report") or {}
+    sample_idx = record.get("sample_idx")
+    qa_mode = record.get("qa_mode", "")
+    original_question = record.get("original_question", "")
+    mock_context = record.get("mock_context", "")
+    module_code = record.get("module_code", "")
+    test_code = record.get("test_code", "")
+    tools = record.get("tools") or []
+
+    parts = [
+        PromptRepository.FILTER_REVIEW_PROMPT,
+        "",
+        "【样本元信息】",
+        f"- sample_idx: {sample_idx}",
+        f"- qa_mode: {qa_mode}",
+        f"- generation_status: {record.get('status', '')}",
+        "",
+        "【原始用户问题（若有）】",
+        _truncate_text(original_question or "<empty>", 1200),
+        "",
+        "【题目三元组】",
+        "PROMPT:",
+        _truncate_text(qa.get("PROMPT", ""), 2000),
+        "",
+        "OUTPUT_FORMAT:",
+        _truncate_text(qa.get("OUTPUT_FORMAT", ""), 1200),
+        "",
+        "ANSWER:",
+        _truncate_text(qa.get("ANSWER", ""), 1200),
+        "",
+        "【mock 测试报告】",
+        _truncate_text(_safe_json_dumps(test_report), 3000),
+        "",
+        "【工具定义】",
+        _format_tools_for_filter(tools),
+        "",
+        "【mocked 函数摘要】",
+        _truncate_text(mock_context or "<empty>", 2500),
+        "",
+        "【module_code】",
+        _truncate_text(module_code or "<empty>", 7000),
+        "",
+        "【test_code】",
+        _truncate_text(test_code or "<empty>", 4000),
+    ]
+    return "\n".join(parts)
+
+
+def build_agent_syn_select_prompt_with_context(record: Dict[str, Any]) -> str:
+    tools = record.get("tools") or []
+    messages = record.get("messages") or []
+    tool_names = record.get("tool_names") or []
+    observed_tool_names = record.get("observed_tool_names") or []
+
+    parts = [
+        PromptRepository.AGENT_SYN_SELECT_PROMPT,
+        "",
+        "【样本元信息】",
+        f"- sample_idx: {record.get('sample_idx')}",
+        f"- tool_definition_count: {record.get('tool_definition_count', len(tools) if isinstance(tools, list) else 0)}",
+        f"- tool_call_count: {record.get('tool_call_count', 0)}",
+        f"- observed_tool_count: {record.get('observed_tool_count', len(observed_tool_names) if isinstance(observed_tool_names, list) else 0)}",
+        f"- tool_names: {', '.join(tool_names) if tool_names else '<empty>'}",
+        f"- observed_tool_names: {', '.join(observed_tool_names) if observed_tool_names else '<empty>'}",
+        "",
+        "【原始首轮用户问题】",
+        _truncate_text(record.get("original_question") or "<empty>", 1600),
+        "",
+        "【工具定义摘要】",
+        _format_tools_for_selection(tools),
+        "",
+        "【原始轨迹摘要】",
+        _format_messages_for_selection(messages),
+    ]
     return "\n".join(parts)

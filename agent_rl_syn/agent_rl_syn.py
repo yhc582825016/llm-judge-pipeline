@@ -107,14 +107,18 @@ class PipelineConfig:
     model: str = "/opt/users/Qwen/Qwen3.5-397B"
 
     temperature: float = 1.0
-    max_tokens: int = 12000
+    mock_max_tokens: int = 4096
+    qa_max_tokens: int = 1024
     repetition_penalty: float = 1.05
     enable_thinking: bool = False
+    request_timeout_sec: float = 180.0
+    max_request_retries: int = 2
+    request_retry_backoff_sec: float = 3.0
 
     min_tool_calls: int = 0                  # 若只保留多工具样本，可改为 2
     max_samples: Optional[int] = None
 
-    qa_mode: str = "difficult"               # "extra_difficult" / "boundary_missing" / "difficult" / "easy"
+    qa_mode: str = "extra_difficult"               # "extra_difficult" / "boundary_missing" / "difficult" / "easy"
     use_original_question_for_generation: bool = False
 
     test_timeout_sec: int = 30
@@ -124,11 +128,8 @@ class PipelineConfig:
     save_raw_response: bool = True
 
     # 新增
-    num_workers: int = 4                     # 多线程并发数
+    num_workers: int = 16                    # 多线程并发数
     resume: bool = True                      # 是否断点续跑
-    success_only_output: bool = True         # output_path 只写成功样本
-    require_quality_ok: bool = True          # 成功样本必须通过质量门槛
-    enable_rule_verifier: bool = True        # 启用规则 verifier
 
 
 # ============================================================
@@ -145,27 +146,63 @@ class LocalLLMClient:
             self._local.client = OpenAI(
                 api_key=self.config.api_key,
                 base_url=self.config.base_url,
+                timeout=self.config.request_timeout_sec,
+                max_retries=0,
             )
         return self._local.client
 
-    def chat(self, messages: List[Dict[str, str]]) -> str:
-        client = self._get_client()
-        completion = client.chat.completions.create(
-            model=self.config.model,
-            messages=messages,
-            temperature=self.config.temperature,
-            max_tokens=self.config.max_tokens,
-            extra_body={
-                "repetition_penalty": self.config.repetition_penalty,
-                "chat_template_kwargs": {
-                    "enable_thinking": self.config.enable_thinking
-                },
-            },
+    def _reset_client(self) -> None:
+        if hasattr(self._local, "client"):
+            delattr(self._local, "client")
+
+    def chat(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        max_tokens: int,
+        request_name: str,
+    ) -> str:
+        last_exc: Optional[Exception] = None
+
+        for attempt in range(1, self.config.max_request_retries + 2):
+            try:
+                client = self._get_client()
+                completion = client.chat.completions.create(
+                    model=self.config.model,
+                    messages=messages,
+                    temperature=self.config.temperature,
+                    max_tokens=max_tokens,
+                    timeout=self.config.request_timeout_sec,
+                    extra_body={
+                        "repetition_penalty": self.config.repetition_penalty,
+                        "chat_template_kwargs": {
+                            "enable_thinking": self.config.enable_thinking
+                        },
+                    },
+                )
+                result = completion.choices[0].message.content or ""
+                if "</think>" in result:
+                    result = result.split("</think>")[-1]
+                return result.strip()
+            except Exception as exc:
+                last_exc = exc
+                self._reset_client()
+                if attempt > self.config.max_request_retries:
+                    break
+
+                sleep_sec = self.config.request_retry_backoff_sec * attempt
+                print(
+                    f"[warn] {request_name} attempt {attempt}/{self.config.max_request_retries + 1} "
+                    f"failed with {type(exc).__name__}: {exc}. Retrying in {sleep_sec:.1f}s.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(sleep_sec)
+
+        raise RuntimeError(
+            f"{request_name} failed after {self.config.max_request_retries + 1} attempts: "
+            f"{type(last_exc).__name__}: {last_exc}"
         )
-        result = completion.choices[0].message.content or ""
-        if "</think>" in result:
-            result = result.split("</think>")[-1]
-        return result.strip()
 
 
 # ============================================================
@@ -270,137 +307,12 @@ class MockContextBuilder:
         return "\n".join(lines).strip() or module_code[:4000]
 
 
-class RuleVerifier:
-    FORBIDDEN_PROMPT_TERMS = (
-        "测试数据", "样例数据", "当前数据集", "本地数据", "演示环境", "run_demo",
-        "mock", "mocked", "工具调用", "函数调用", "评测",
-    )
-
-    @staticmethod
-    def _extract_function_names(module_code: str) -> List[str]:
-        try:
-            tree = ast.parse(module_code)
-        except Exception:
-            return []
-
-        names = []
-        for node in tree.body:
-            if isinstance(node, ast.FunctionDef) and not node.name.startswith("_") and node.name != "run_demo":
-                names.append(node.name)
-        return names
-
-    @staticmethod
-    def _detect_required_tool_count(prompt_text: str) -> int:
-        text = prompt_text or ""
-        if any(token in text for token in ("然后", "最后", "分别", "同时", "先", "再", "并")):
-            return 2
-        return 1
-
-    @staticmethod
-    def _parse_diag(answer_text: str) -> Dict[str, str]:
-        text = (answer_text or "").strip()
-        match = re.fullmatch(r"//diag\{(.*)\}", text, flags=re.DOTALL)
-        if not match:
-            return {}
-
-        body = match.group(1).strip()
-        result: Dict[str, str] = {}
-        for part in body.split(";"):
-            if "=" not in part:
-                continue
-            key, value = part.split("=", 1)
-            result[key.strip()] = value.strip()
-        return result
-
-    @classmethod
-    def verify(cls, qa_info: Dict[str, str], module_code: str, qa_mode: str) -> Dict[str, Any]:
-        issues: List[str] = []
-        prompt_text = qa_info.get("PROMPT", "").strip()
-        output_format = qa_info.get("OUTPUT_FORMAT", "").strip()
-        answer = qa_info.get("ANSWER", "").strip()
-
-        if not prompt_text:
-            issues.append("empty prompt")
-        if not output_format:
-            issues.append("empty output_format")
-        if not answer:
-            issues.append("empty answer")
-
-        for term in cls.FORBIDDEN_PROMPT_TERMS:
-            if term.lower() in prompt_text.lower():
-                issues.append(f"prompt leaks generation context: {term}")
-                break
-
-        if len(prompt_text) > (150 if qa_mode == "extra_difficult" else 120):
-            issues.append("prompt too long for selected qa_mode")
-
-        if output_format.startswith("//box{") and not answer.startswith("//box{"):
-            issues.append("answer does not match //box output format")
-        if output_format.startswith("//diag{") and not answer.startswith("//diag{"):
-            issues.append("answer does not match //diag output format")
-
-        if prompt_text and answer and prompt_text == answer:
-            issues.append("prompt and answer are identical")
-
-        function_names = cls._extract_function_names(module_code)
-        if not function_names:
-            issues.append("no callable mocked functions extracted from module")
-
-        if qa_mode == "extra_difficult" and len(function_names) < 2:
-            issues.append("extra_difficult sample has fewer than 2 mocked functions")
-
-        if qa_mode == "boundary_missing":
-            fmt_diag = cls._parse_diag(output_format)
-            ans_diag = cls._parse_diag(answer)
-            if not fmt_diag:
-                issues.append("boundary_missing output_format is not valid //diag")
-            if not ans_diag:
-                issues.append("boundary_missing answer is not valid //diag")
-
-            if fmt_diag.get("tag") != "BOUNDARY_CASE_V1" or ans_diag.get("tag") != "BOUNDARY_CASE_V1":
-                issues.append("boundary_missing tag must be BOUNDARY_CASE_V1")
-
-            allowed_cases = {"missing_parameters", "missing_functions"}
-            allowed_actions = {"clarifying_question", "graceful_decline"}
-            answer_case = ans_diag.get("case")
-            answer_action = ans_diag.get("expected_action")
-            if answer_case not in allowed_cases:
-                issues.append("boundary_missing case is invalid")
-            if answer_action not in allowed_actions:
-                issues.append("boundary_missing expected_action is invalid")
-            if answer_case == "missing_parameters" and answer_action != "clarifying_question":
-                issues.append("missing_parameters must map to clarifying_question")
-            if answer_case == "missing_functions" and answer_action != "graceful_decline":
-                issues.append("missing_functions must map to graceful_decline")
-            if ans_diag.get("answer") != "<TBD>" and ans_diag.get("answer") != "TBD":
-                issues.append("boundary_missing answer placeholder must stay TBD")
-        else:
-            required_tool_count = cls._detect_required_tool_count(prompt_text)
-            if required_tool_count > len(function_names):
-                issues.append("prompt implies more steps than available mocked functions")
-
-        if "首字母" in prompt_text or "acronym" in prompt_text.lower():
-            issues.append("meaningless letter-concat style prompt")
-
-        return {
-            "ok": len(issues) == 0,
-            "issues": issues,
-            "mock_function_count": len(function_names),
-            "mock_function_names": function_names,
-        }
-
-
-# ============================================================
-# Mock 测试器
-# ============================================================
-
 class MockTestRunner:
     """
     改进版：
     1. module / test 分文件
     2. 子进程隔离执行
     3. 结构化测试报告
-    4. 增加一些“质量检查”，避免只靠 exec
     """
 
     HARNESS_CODE = r'''
@@ -476,48 +388,7 @@ print(json.dumps(REPORT, ensure_ascii=False))
             return test_code
         return import_line + "\n\n" + test_code
 
-    def _quality_check(self, module_code: str, test_code: str) -> Dict[str, Any]:
-        issues = []
-
-        banned_phrases = [
-            "unsupported mocked input",
-            "No mock defined",
-            "not implemented for this input",
-            "only specific predefined combinations are supported",
-        ]
-        for phrase in banned_phrases:
-            if phrase in module_code:
-                issues.append(f"module code contains banned fallback phrase: {phrase}")
-
-        if "assert " not in test_code and "assert(" not in test_code:
-            issues.append("test code does not contain assert")
-
-        if "def test_" not in test_code:
-            issues.append("test code does not contain any test_* function")
-
-        empty_return_patterns = [
-            r"return\s+\[\s*\]",
-            r"return\s+\"\"",
-            r"return\s+''",
-            r"return\s+\{\s*\}",
-            r"return\s+None",
-        ]
-        empty_return_hits = 0
-        for p in empty_return_patterns:
-            empty_return_hits += len(re.findall(p, module_code))
-        if empty_return_hits >= 4:
-            issues.append(
-                f"module code contains too many empty fallback returns ({empty_return_hits} hits)"
-            )
-
-        return {
-            "quality_ok": len(issues) == 0,
-            "quality_issues": issues,
-        }
-
     def run(self, module_code: str, test_code: str) -> Dict[str, Any]:
-        quality_report = self._quality_check(module_code, test_code)
-
         module_syntax_error = self._syntax_check(module_code, "generated_mock_module.py")
         test_syntax_error = self._syntax_check(test_code, "generated_mock_test.py")
 
@@ -530,7 +401,6 @@ print(json.dumps(REPORT, ensure_ascii=False))
                 "test_functions": [],
                 "passed": [],
                 "failed": [],
-                **quality_report,
             }
 
         wrapped_test_code = self._ensure_test_import(test_code)
@@ -561,7 +431,6 @@ print(json.dumps(REPORT, ensure_ascii=False))
                     "test_functions": [],
                     "passed": [],
                     "failed": [{"name": "__timeout__", "error": f"timeout > {self.timeout_sec}s"}],
-                    **quality_report,
                 }
 
             stdout = (proc.stdout or "").strip()
@@ -576,7 +445,6 @@ print(json.dumps(REPORT, ensure_ascii=False))
                     "passed": [],
                     "failed": [{"name": "__empty_stdout__", "error": stderr or "empty stdout"}],
                     "stderr": stderr,
-                    **quality_report,
                 }
 
             last_line = stdout.splitlines()[-1]
@@ -594,7 +462,6 @@ print(json.dumps(REPORT, ensure_ascii=False))
             report["stdout"] = stdout[-4000:]
             report["stderr"] = stderr[-4000:]
             report["timeout"] = False
-            report.update(quality_report)
             return report
 
 
@@ -605,11 +472,22 @@ print(json.dumps(REPORT, ensure_ascii=False))
 class ToolSynthesisPipeline:
     def __init__(self, config: PipelineConfig):
         self.config = config
+        self._ensure_output_file_parent(config.output_path, "output_path")
+        self._ensure_output_file_parent(config.progress_path, "progress_path")
         self.llm = LocalLLMClient(config)
         self.test_runner = MockTestRunner(timeout_sec=config.test_timeout_sec)
 
         self.output_writer = ThreadSafeJsonlWriter(config.output_path)
         self.progress_writer = ThreadSafeJsonlWriter(config.progress_path)
+
+    @staticmethod
+    def _ensure_output_file_parent(path: str, label: str) -> None:
+        if os.path.isdir(path):
+            raise IsADirectoryError(f"{label} must be a file path, got directory: {path}")
+
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
 
     @staticmethod
     def ensure_tools_obj(tools_field: Union[str, List[Dict[str, Any]], None]) -> List[Dict[str, Any]]:
@@ -722,9 +600,10 @@ class ToolSynthesisPipeline:
         try:
             tools = self.ensure_tools_obj(sample.get("tools"))
             original_question = self.extract_original_user_question(sample)
+            record["tools"] = tools
             record["tool_names"] = [t.get("function", {}).get("name", "") for t in tools]
             record["used_original_question_for_generation"] = self.config.use_original_question_for_generation
-            if self.config.use_original_question_for_generation:
+            if original_question:
                 record["original_question"] = original_question
 
             # 1) 生成 mock module + test
@@ -734,7 +613,11 @@ class ToolSynthesisPipeline:
                 original_question,
             )
             messages = [{"role": "user", "content": mock_prompt}]
-            mock_response = self.llm.chat(messages)
+            mock_response = self.llm.chat(
+                messages,
+                max_tokens=self.config.mock_max_tokens,
+                request_name=f"sample {sample_idx} mock_generation",
+            )
             messages.append({"role": "assistant", "content": mock_response})
 
             parsed_code = ResponseParser.extract_python_blocks(mock_response)
@@ -760,7 +643,11 @@ class ToolSynthesisPipeline:
                         "这类题目没有实际业务意义，必须重写为真实查询/筛选/比对任务。"
                     )
                 qa_messages = [{"role": "user", "content": qa_prompt + extra_guard}]
-                qa_response = self.llm.chat(qa_messages)
+                qa_response = self.llm.chat(
+                    qa_messages,
+                    max_tokens=self.config.qa_max_tokens,
+                    request_name=f"sample {sample_idx} qa_generation_try_{qa_try + 1}",
+                )
                 qa_info = ResponseParser.extract_qa(qa_response)
                 if not self.is_meaningless_letter_concat_question(qa_info.get("PROMPT", "")):
                     break
@@ -770,24 +657,14 @@ class ToolSynthesisPipeline:
 
             # 3) 执行 mock 测试
             test_report = self.test_runner.run(module_code, test_code)
-            verifier_report = (
-                RuleVerifier.verify(qa_info, module_code, self.config.qa_mode)
-                if self.config.enable_rule_verifier
-                else {"ok": True, "issues": [], "mock_function_count": 0, "mock_function_names": []}
-            )
-            quality_ok = test_report.get("quality_ok", True)
-            verifier_ok = verifier_report.get("ok", True)
             test_ok = test_report.get("ok", False)
-            final_ok = test_ok and verifier_ok
-            if self.config.require_quality_ok:
-                final_ok = final_ok and quality_ok
+            final_ok = test_ok
 
             record.update({
                 "status": "ok" if final_ok else "test_failed",
                 "qa_mode": self.config.qa_mode,
                 "qa": qa_info,
                 "test_report": test_report,
-                "verifier_report": verifier_report,
                 "mock_context": mock_context,
                 "elapsed_sec": round(time.time() - start_time, 3),
             })
@@ -807,13 +684,18 @@ class ToolSynthesisPipeline:
             record["elapsed_sec"] = round(time.time() - start_time, 3)
             return record
 
-    def prepare_input_samples(self, data: List[Dict[str, Any]]) -> List[Tuple[int, Dict[str, Any]]]:
+    def prepare_input_samples(self, data: List[Dict[str, Any]]) -> Tuple[List[Tuple[int, Dict[str, Any]]], Dict[str, int]]:
         """
         1. 先做样本过滤（min_tool_calls）
         2. 再做断点续跑过滤（跳过已成功导出的 sample_idx）
         3. 最后按 max_samples 截断
         """
         candidate = []
+        stats = {
+            "filtered_by_min_tool_calls": 0,
+            "filtered_by_resume_existing": 0,
+            "filtered_by_max_samples": 0,
+        }
 
         existing_success_ids = set()
         if self.config.resume and os.path.exists(self.config.output_path):
@@ -821,15 +703,19 @@ class ToolSynthesisPipeline:
 
         for idx, sample in enumerate(data):
             if not self.should_process(sample):
+                stats["filtered_by_min_tool_calls"] += 1
                 continue
             if self.config.resume and idx in existing_success_ids:
+                stats["filtered_by_resume_existing"] += 1
                 continue
             candidate.append((idx, sample))
 
         if self.config.max_samples is not None:
+            if len(candidate) > self.config.max_samples:
+                stats["filtered_by_max_samples"] = len(candidate) - self.config.max_samples
             candidate = candidate[:self.config.max_samples]
 
-        return candidate
+        return candidate, stats
 
     def write_result(self, record: Dict[str, Any]):
         """
@@ -839,10 +725,7 @@ class ToolSynthesisPipeline:
         为了断点续跑稳妥，成功样本先写 output，再写 progress
         """
         if record["status"] == "ok":
-            if self.config.success_only_output:
-                self.output_writer.append(record)
-            else:
-                self.output_writer.append(record)
+            self.output_writer.append(record)
 
         self.progress_writer.append({
             "sample_idx": record.get("sample_idx"),
@@ -865,11 +748,18 @@ class ToolSynthesisPipeline:
             raise ValueError("input data must be a list-like json/jsonl content")
 
         total_input = len(data)
-        candidate = self.prepare_input_samples(data)
+        candidate, filter_stats = self.prepare_input_samples(data)
 
         submitted = len(candidate)
         success = 0
         failed = 0
+        test_ok_count = 0
+        error_count = 0
+        input_filtered = (
+            filter_stats["filtered_by_min_tool_calls"]
+            + filter_stats["filtered_by_resume_existing"]
+            + filter_stats["filtered_by_max_samples"]
+        )
 
         if submitted == 0:
             return {
@@ -877,6 +767,12 @@ class ToolSynthesisPipeline:
                 "submitted": 0,
                 "success": 0,
                 "failed": 0,
+                "filtered_before_submit": input_filtered,
+                "filtered_by_min_tool_calls": filter_stats["filtered_by_min_tool_calls"],
+                "filtered_by_resume_existing": filter_stats["filtered_by_resume_existing"],
+                "filtered_by_max_samples": filter_stats["filtered_by_max_samples"],
+                "passed_after_submit": 0,
+                "filtered_after_submit": 0,
                 "skipped_or_already_done": total_input,
                 "output_path": self.config.output_path,
                 "progress_path": self.config.progress_path,
@@ -888,7 +784,10 @@ class ToolSynthesisPipeline:
                 for idx, sample in candidate
             }
 
-            for future in tqdm(as_completed(future_to_idx), total=len(future_to_idx), desc="synthesizing"):
+            for processed_count, future in enumerate(
+                tqdm(as_completed(future_to_idx), total=len(future_to_idx), desc="synthesizing"),
+                start=1,
+            ):
                 idx = future_to_idx[future]
                 try:
                     record = future.result()
@@ -901,18 +800,43 @@ class ToolSynthesisPipeline:
 
                 self.write_result(record)
 
+                test_ok = bool(record.get("test_report", {}).get("ok", False))
+
+                if record.get("status") == "error":
+                    error_count += 1
+                if test_ok:
+                    test_ok_count += 1
+
                 if record["status"] == "ok":
                     success += 1
                 else:
                     failed += 1
 
+                if processed_count % 10 == 0 or processed_count == submitted:
+                    print(
+                        "processed/submitted: "
+                        f"{processed_count}/{submitted} | "
+                        f"test_ok: {test_ok_count} | "
+                        f"final_ok: {success} | "
+                        f"errors: {error_count}",
+                        flush=True,
+                    )
+
         skipped_or_already_done = total_input - submitted
+        passed_after_submit = success
+        filtered_after_submit = failed
 
         return {
             "input_total": total_input,
             "submitted": submitted,
             "success": success,
             "failed": failed,
+            "filtered_before_submit": input_filtered,
+            "filtered_by_min_tool_calls": filter_stats["filtered_by_min_tool_calls"],
+            "filtered_by_resume_existing": filter_stats["filtered_by_resume_existing"],
+            "filtered_by_max_samples": filter_stats["filtered_by_max_samples"],
+            "passed_after_submit": passed_after_submit,
+            "filtered_after_submit": filtered_after_submit,
             "skipped_or_already_done": skipped_or_already_done,
             "output_path": self.config.output_path,
             "progress_path": self.config.progress_path,
@@ -940,6 +864,14 @@ if __name__ == "__main__":
         default="/dev/shm/ye/rl-data/agent_syn_data/recall/synthetic_mock_progress.jsonl",
     )
     parser.add_argument(
+        "--base-url",
+        default="http://127.0.0.1:6031/v1",
+    )
+    parser.add_argument(
+        "--model",
+        default="/opt/users/Qwen/Qwen3.5-397B",
+    )
+    parser.add_argument(
         "--qa-mode",
         default="extra_difficult",
         choices=["extra_difficult", "boundary_missing", "difficult", "easy"],
@@ -947,12 +879,42 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max-samples",
         type=int,
-        default=20000,
+        default=300000,
     )
     parser.add_argument(
         "--min-tool-calls",
         type=int,
         default=3,
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=16,
+    )
+    parser.add_argument(
+        "--mock-max-tokens",
+        type=int,
+        default=4096,
+    )
+    parser.add_argument(
+        "--qa-max-tokens",
+        type=int,
+        default=1024,
+    )
+    parser.add_argument(
+        "--request-timeout-sec",
+        type=float,
+        default=180.0,
+    )
+    parser.add_argument(
+        "--max-request-retries",
+        type=int,
+        default=2,
+    )
+    parser.add_argument(
+        "--request-retry-backoff-sec",
+        type=float,
+        default=3.0,
     )
     args = parser.parse_args()
 
@@ -965,6 +927,9 @@ if __name__ == "__main__":
         # 保存全部过程记录，便于排查和断点续跑观察
         progress_path=args.progress_path,
 
+        base_url=args.base_url,
+        model=args.model,
+
         # 如果你只想处理并行 / 多工具样本，就改成 2
         min_tool_calls=args.min_tool_calls,
 
@@ -974,6 +939,12 @@ if __name__ == "__main__":
         qa_mode=args.qa_mode,
         use_original_question_for_generation=True,
 
+        mock_max_tokens=args.mock_max_tokens,
+        qa_max_tokens=args.qa_max_tokens,
+        request_timeout_sec=args.request_timeout_sec,
+        max_request_retries=args.max_request_retries,
+        request_retry_backoff_sec=args.request_retry_backoff_sec,
+
         # 全量生产建议别覆盖，避免误删历史结果
         overwrite_output=False,
         overwrite_progress=False,
@@ -981,11 +952,9 @@ if __name__ == "__main__":
         save_raw_response=True,
 
         # 新增能力
-        num_workers=100,
+        num_workers=args.num_workers,
         resume=True,
-        success_only_output=True,
-
-        test_timeout_sec=30,
+        test_timeout_sec=300,
     )
 
     pipeline = ToolSynthesisPipeline(config)
